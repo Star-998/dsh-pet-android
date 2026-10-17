@@ -1,0 +1,22 @@
+# 构建产物
+build/
+.gradle/
+local.properties
+
+# 生成出来的素材与配置（可由 tools/fetch-and-transcode.ps1 重现）
+app/src/main/assets/webp/
+app/src/main/assets/pet-config.json
+anim-map.json
+
+# 打包产物
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 调试残留
+*.log
