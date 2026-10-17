@@ -93,7 +93,9 @@ echo "sdk.dir=/path/to/android-sdk" > local.properties
 python tools/verify_webp.py
 ```
 
-CI：`.github/workflows/build.yml` 会在 push 与 PR 上自动还原素材并构建 APK。
+CI：把 `ci/build.yml.example` 复制成 `.github/workflows/build.yml` 即可启用
+（push 与 PR 自动还原素材并构建 APK）。GitHub 要求推送 workflow 文件时 token 带
+`workflow` 权限，所以它没有随首次提交一起推上去，需要手动加一次。
 
 ## 代码结构
 
