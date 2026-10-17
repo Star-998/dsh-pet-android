@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">桌宠</string>
+
+    <string name="channel_name">桌宠常驻</string>
+    <string name="notif_title">桌宠正在桌面上</string>
+    <string name="notif_text">点这里回到设置</string>
+    <string name="notif_stop">收起来</string>
+
+    <string name="title">DSH 桌宠 · Android</string>
+    <string name="subtitle">从 dsh-pet 移植：透明动画 · 点击回应 · 拖拽甩抛 · 屏幕漫游。没有 AI，也不联网。</string>
+    <string name="status_placeholder">正在读取状态…</string>
+
+    <string name="perm_overlay">显示在其他应用上层</string>
+    <string name="perm_notif">通知</string>
+    <string name="perm_ok">%1$s：已授权</string>
+    <string name="perm_no">%1$s：未授权</string>
+    <string name="state_value">运行状态：%1$s</string>
+    <string name="state_on">已放出来</string>
+    <string name="state_off">已收起</string>
+    <string name="size_value">大小：%1$d dp</string>
+    <string name="need_overlay">还没有悬浮窗权限，请先点上面那个按钮授权。</string>
+
+    <string name="btn_overlay">授予「显示在其他应用上层」</string>
+    <string name="btn_notif">授予通知权限</string>
+    <string name="btn_start">放出来</string>
+    <string name="btn_stop">收起来</string>
+    <string name="size_title">大小</string>
+    <string name="menu_title">选择动作</string>
+
+    <string name="help">使用提示\n\n· 荣耀 / MagicOS：设置 → 应用 → 桌宠 → 电池 → 允许后台活动；再把本应用加进「应用启动管理」的允许列表，锁屏后才不会被清掉。\n\n· 小米 / 红米：设置 → 应用设置 → 桌面宠物 → 省电策略选「无限制」，并在「自启动」里打开。\n\n· 点击 = 随机反应动画并 Q 弹；按住拖动 = 跟手移动；用力甩出 = 沿抛物线飞出去，撞边反弹、落地摩擦减速。\n\n· 每个宠物只占自己那一小块悬浮窗，窗口外照常用其他 app。\n\n· 完全离线：没有碎碎念、对话、余额查询，因此没有网络权限，也不消耗任何 token。</string>
+</resources>
