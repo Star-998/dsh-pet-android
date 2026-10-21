@@ -69,6 +69,12 @@ class PetService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        // 兜底：即使 Application 没被自定义（或在某些机型上被跳过），也保证音效预载
+        try {
+            Sfx.init(this)
+        } catch (t: Throwable) {
+            Diag.record(this, "onCreate: 音效初始化失败", t)
+        }
         try {
             wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         } catch (t: Throwable) {
