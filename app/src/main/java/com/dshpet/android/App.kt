@@ -15,5 +15,8 @@ class App : Application() {
             def?.uncaughtException(thread, ex)
         }
         Diag.record(this, "应用进程启动，已安装崩溃捕获")
+        // 点击音效只需预载一次
+        Sfx.init(this)
+        Sfx.enabled = Prefs.soundOn(this)
     }
 }
