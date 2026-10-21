@@ -213,24 +213,27 @@ class Pet(
                 currentSlug = slug
                 dd.start()
                 canvasView.invalidate()
-                if (onEnd != null) waitClipEnd(dd, token, onEnd)
+                Log.i(TAG, "play $slug ${cfg.durationOf(slug)}ms")
+                scheduleClipEnd(slug, token, onEnd)
             }
         }
     }
 
-    /** 轮询 isRunning 判断片段是否播完（AnimatedImageDrawable 没有完成回调） */
-    private fun waitClipEnd(d: AnimatedImageDrawable, token: Int, onEnd: () -> Unit) {
-        val poll = object : Runnable {
-            override fun run() {
-                if (token != loadToken) return
-                if (d.isRunning) {
-                    canvasView.postDelayed(this, 120)
-                } else {
-                    onEnd()
-                }
-            }
-        }
-        canvasView.postDelayed(poll, 200)
+    /**
+     * 按「这段动画播一遍的时长」收尾，与 repeat 语义彻底解耦。
+     *
+     * 旧实现用轮询 `isRunning` 判断播完，但 `AnimatedImageDrawable.repeatCount = 1`
+     * 在多数机型上表示「再重复一次」= 一共播两遍，于是用户看到每个动作都做两遍。
+     * 改成毫秒级定时：到点强制 stop，再交给 onEnd 接下一段。
+     */
+    private fun scheduleClipEnd(slug: String, token: Int, onEnd: (() -> Unit)?) {
+        val ms = cfg.durationOf(slug).coerceIn(500, 30_000).toLong()
+        canvasView.postDelayed({
+            if (token != loadToken) return@postDelayed
+            Log.i(TAG, "end $slug token=$token cur=$loadToken")
+            current?.stop()
+            onEnd?.invoke()
+        }, ms)
     }
 
     private fun pickByWeight(items: List<AnimCategory>): AnimCategory? {
@@ -250,6 +253,7 @@ class Pet(
      * 与 dsh-pet 客户端一致（默认 idle 10 / turn 5 / move 5，其余随机动作）。
      */
     private fun scheduleNext() {
+        Log.i(TAG, "-> scheduleNext")
         val wIdle = max(cfg.weightIdle, 0)
         val wTurn = max(cfg.weightTurn, 0)
         val wMove = max(cfg.weightMove, 0)
@@ -265,6 +269,7 @@ class Pet(
     }
 
     private fun playIdle() {
+        Log.i(TAG, "-> playIdle")
         if (cfg.idle.isEmpty()) { playRandomAction(); return }
         mode = Mode.IDLE
         play(cfg.idle.random()) { scheduleNext() }
@@ -280,6 +285,7 @@ class Pet(
     }
 
     private fun playRandomAction() {
+        Log.i(TAG, "-> playRandomAction")
         val cat = pickByWeight(cfg.categories)
         if (cat == null || cat.actions.isEmpty()) { playIdle(); return }
         forcedNoMirror = cat.noMirror
@@ -292,27 +298,38 @@ class Pet(
 
     /** 漫游：朝当前朝向走一段（距离按 size/462 等比缩放），出界则退回待机 */
     private fun playMove() {
+        Log.i(TAG, "-> playMove")
         if (cfg.moves.isEmpty()) { playIdle(); return }
         val act = cfg.moves.random()
         val scale = sizePx / PetConfig.PET_REF_WIDTH
         val dist = Random.nextDouble(act.minDist, max(act.maxDist, act.minDist + 1.0)) * scale
-        val target = x + facing * dist
+        // 统一换算到「框中心」再比较：`x` 是左上角，直接拿它和中心边界比会偏半个身位，
+        // 这正是随机漫游时她会跑出屏幕的原因。
         val halfW = sizePx / 2.0
-        val side = sideAllow()
         val margin = cfg.moveMargin * density
         val dm = context.resources.displayMetrics
-        val leftBound = margin + halfW - side
-        val rightBound = dm.widthPixels - margin - halfW + side
-        if (target < leftBound || target > rightBound) {
-            // 走不了就掉头（避免卡在边上连续放弃）
+        val centerX = x + halfW
+        val targetCenter = centerX + facing * dist
+        // 漫游必须整只留在屏幕内：这里不沿用拖拽/甩抛的 sideAllow（那会允许贴边出屏）。
+        val minLeft = minOf(margin, (dm.widthPixels - sizePx) / 2.0).coerceAtLeast(0.0)
+        val maxLeft = maxOf(minLeft, dm.widthPixels - sizePx - minLeft)
+        val leftBound = minLeft + halfW
+        val rightBound = maxLeft + halfW
+        // 越界时不再「掉头待机」——把目标夹回可走范围，让她走到边上就停，
+        // 这样既不会出屏，也不会因为一次越界就浪费掉整条漫游。
+        val clamped = targetCenter.coerceIn(leftBound, rightBound)
+        if (abs(clamped - centerX) < 4.0) {
+            // 已经贴边且朝外，没得走：掉头，下一条再来
             facing = -facing
             canvasView.invalidate()
+            Log.i(TAG, "move skip: at edge center=$centerX facing=$facing")
             playIdle()
             return
         }
         mode = Mode.MOVE
         moveFromX = x
-        moveToX = target
+        moveToX = (clamped - halfW).coerceIn(minLeft, maxLeft)
+        Log.i(TAG, "move dist=${dist.toInt()} facing=$facing center=$centerX -> ${clamped.toInt()}  left=[$minLeft..$maxLeft]  x=$x -> $moveToX")
         moveStartMs = SystemClock.uptimeMillis()
         moveDurationMs = MOVE_WINDOW_MS
         play(act.slug) {
@@ -346,6 +363,7 @@ class Pet(
     }
 
     private fun onTap() {
+        Log.i(TAG, "-> onTap")
         squash(Physics.SQ_SQUASH)
         if (cfg.clicks.isEmpty()) { playIdle(); return }
         mode = Mode.IDLE
@@ -501,6 +519,7 @@ class Pet(
             val rawY = event.rawY.toDouble()
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    Log.i(TAG, "-> down raw=(${rawX.toInt()},${rawY.toInt()}) pet=(${this@Pet.x.toInt()},${this@Pet.y.toInt()})")
                     downRawX = rawX
                     downRawY = rawY
                     downAtMs = nowMs()
@@ -508,6 +527,7 @@ class Pet(
                     grabDY = rawY - this@Pet.y
                     dragging = false
                     pressed = true
+                    Sfx.press()
                     longPressFired = false
                     canvasView.removeCallbacks(longPressRunnable)
                     canvasView.postDelayed(longPressRunnable, 450L)
@@ -540,6 +560,7 @@ class Pet(
                     return true
                 }
                 MotionEvent.ACTION_UP -> {
+                    Log.i(TAG, "-> up drag=$dragging long=$longPressFired")
                     pressed = false
                     canvasView.removeCallbacks(longPressRunnable)
                     val now = nowMs()
@@ -550,6 +571,7 @@ class Pet(
                         return true
                     }
                     if (!dragging) {
+                        Sfx.release()
                         onTap()
                     } else {
                         val trimmed = Physics.trimTrail(trail, now)
