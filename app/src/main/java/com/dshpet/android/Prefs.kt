@@ -7,6 +7,7 @@ object Prefs {
     private const val FILE = "dsh_pet"
     private const val KEY_SIZE = "size_dp"
     private const val KEY_RUNNING = "running"
+    private const val KEY_SOUND = "sound_on"
 
     const val DEFAULT_SIZE_DP = 150
     const val MIN_SIZE_DP = 80
@@ -24,5 +25,12 @@ object Prefs {
 
     fun setRunning(ctx: Context, v: Boolean) {
         sp(ctx).edit().putBoolean(KEY_RUNNING, v).apply()
+    }
+
+    /** 点击音效开关，默认开启 */
+    fun soundOn(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_SOUND, true)
+
+    fun setSoundOn(ctx: Context, v: Boolean) {
+        sp(ctx).edit().putBoolean(KEY_SOUND, v).apply()
     }
 }
