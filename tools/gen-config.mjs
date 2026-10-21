@@ -10,12 +10,21 @@
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 
-const PLUGIN_CONFIG = process.argv[2];
-const ANIM_MAP = process.argv[3];
-const OUT = process.argv[4];
+// 位置参数：config.jsonc / anim-map.json / out.json
+// 可选参数：--name <宠物名>  --durations <durations.json>
+const argv = process.argv.slice(2);
+const flags = { name: null, durations: null };
+const positional = [];
+for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a === '--name') { flags.name = argv[++i] ?? null; continue; }
+  if (a === '--durations') { flags.durations = argv[++i] ?? null; continue; }
+  positional.push(a);
+}
+const [PLUGIN_CONFIG, ANIM_MAP, OUT] = positional;
 
 if (!PLUGIN_CONFIG || !ANIM_MAP || !OUT) {
-  console.error('usage: node gen-config.mjs <config.jsonc> <anim-map.json> <out.json>');
+  console.error('usage: node gen-config.mjs <config.jsonc> <anim-map.json> <out.json> [--name 名字] [--durations durations.json]');
   process.exit(2);
 }
 
@@ -93,7 +102,7 @@ for (const c of anims.categories ?? []) {
 // 手机端尺寸：桌面配置里的 462 是 640×360 画布下的桌面像素，手机用 dp；给个适合手掌的默认值
 const pets = (cfg.pets ?? []).map((p, i) => ({
   id: p.id ?? `pet${i}`,
-  name: p.name ?? `宠物${i + 1}`,
+  name: flags.name ?? p.name ?? `宠物${i + 1}`,
   size: 150,
   corner: p.position?.corner ?? 'top-right',
   marginX: p.position?.marginX ?? 24,
@@ -105,9 +114,17 @@ if (pets.length === 0) pets.push({ id: 'main', name: '宠物', size: 150, corner
 const names = {};
 for (const [n, v] of Object.entries(map)) names[v.file] = n;
 
+// 每段动画的时长（毫秒）。由 tools/make-durations.py 按帧数/15fps 算出。
+// 手机端靠这个时长在"播完一遍"时切下一段，避免依赖 AnimatedImageDrawable 的 repeat 语义。
+const durations = {};
+if (flags.durations && existsSync(flags.durations)) {
+  Object.assign(durations, JSON.parse(readFileSync(flags.durations, 'utf8').replace(/^\uFEFF/, '')));
+}
+
 const out = {
   pets,
   names,
+  durations,
   animations: {
     idle: slugList(anims.idle),
     turn: slugList(anims.turn),
