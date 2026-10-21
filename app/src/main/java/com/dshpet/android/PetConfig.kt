@@ -33,6 +33,8 @@ data class AnimCategory(
 class PetConfig(
     val pets: List<PetSpec>,
     val names: Map<String, String>,
+    /** 动画 slug → 时长（毫秒）。手机端靠它在"播完一遍"时切下一段。 */
+    val durations: Map<String, Int>,
     val idle: List<String>,
     val turn: List<String>,
     val drag: List<String>,
@@ -49,6 +51,9 @@ class PetConfig(
 ) {
     /** slug → 可读动画名（长按菜单里显示） */
     fun nameOf(slug: String): String = names[slug] ?: slug
+
+    /** slug → 该段动画播一遍的毫秒数（配置缺失时给个保守默认） */
+    fun durationOf(slug: String): Int = durations[slug] ?: 9000
 
     companion object {
         /** dsh-pet 的移动距离是「基准宠物宽 462px」下的绝对像素，运行时按 size/462 等比缩放 */
@@ -78,6 +83,10 @@ class PetConfig(
             val names = HashMap<String, String>()
             root.optJSONObject("names")?.let { n ->
                 for (k in n.keys()) names[k] = n.optString(k, k)
+            }
+            val durations = HashMap<String, Int>()
+            root.optJSONObject("durations")?.let { d ->
+                for (k in d.keys()) durations[k] = d.optInt(k, 0)
             }
             val idle = anims.stringList("idle")
             val turn = anims.stringList("turn")
@@ -129,6 +138,7 @@ class PetConfig(
             val cfg = PetConfig(
                 pets = pets,
                 names = names,
+                durations = durations,
                 idle = idle,
                 turn = turn,
                 drag = drag,
