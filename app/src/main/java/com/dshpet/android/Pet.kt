@@ -16,14 +16,15 @@ import kotlin.math.min
 import kotlin.random.Random
 
 /**
- * 一只桌宠的完整运行时：动画链 + 触摸交互 + 拖拽/甩抛物理 + 屏幕漫游。
+ * 一只桌宠的完整运行时：动画链 + 触摸交互 + 拖拽/甩抛物理 + 屏幕漫游 + 贴边躲藏。
  *
  * 与电脑版的对应关系（dsh-pet 源码）：
  *  - 物理与常量        → src/shared/physics.ts（见 Physics.kt，逐行移植，未改数值）
  *  - 命中框/比例        → src/shared/constants.ts（HIT_BOX 200..440 / 640）
  *  - 角落定位          → src/shared/motion.ts anchorPixel()
  *  - 动画链权重        → assets/config.jsonc animationWeights + categories
- * 手机端去掉了碎碎念/对话/余额/通知，因此没有任何网络与 LLM 调用。
+ * 手机端去掉了对话/余额/通知，因此没有任何网络与 LLM 调用（v1.6 起加了本地台词气泡，
+ * 台词全部来自 assets/lines.json，不联网）。
  */
 class Pet(
     private val context: Context,
@@ -37,6 +38,14 @@ class Pet(
         private const val MOVE_WINDOW_MS = 6000L
         /** 拖出这个距离才算拖拽（dp） */
         private const val DRAG_SLOP_DP = 5.0
+        /** 松手时离边缘多近就吸附过去（dp） */
+        private const val SNAP_SLOP_DP = 30.0
+        /** 吸附后闲置多久缩进去躲起来 */
+        private const val HIDE_DELAY_MS = 12_000L
+        /** 躲起来时藏掉多少比例的身子（0.55 = 只露 45%） */
+        private const val HIDE_RATIO = 0.55
+        /** 躲藏位移的每帧平滑系数 */
+        private const val HIDE_LERP = 0.18
         /** 载入解压/解码动画用的后台线程 */
         private val io = Executors.newSingleThreadExecutor()
     }
@@ -49,7 +58,7 @@ class Pet(
     var heightPx: Int = 0
         private set
 
-    /** 包围盒左上角（屏幕 px） */
+    /** 包围盒左上角（屏幕 px，不含躲藏位移） */
     var x = 0.0
         private set
     var y = 0.0
@@ -87,6 +96,18 @@ class Pet(
     private var moveStartMs = 0L
     private var moveDurationMs = MOVE_WINDOW_MS
 
+    // ---- 贴边躲藏 ----
+    /** 是否允许贴边躲藏（设置页可关） */
+    var allowEdgeHide = true
+    /** -1 = 贴在左边缘，+1 = 贴在右边缘，0 = 没贴边 */
+    private var snapEdge = 0
+    /** 躲藏位移目标（负数往左缩，正数往右缩） */
+    private var hideTargetPx = 0.0
+    /** 躲藏位移当前值（每帧平滑逼近目标） */
+    private var hideNowPx = 0.0
+    private var hidden = false
+    private var lastInteractMs = 0L
+
     // ---- Q 弹 ----
     private var squashAtMs = 0L
     private var squashAmount = Physics.SQ_SQUASH
@@ -96,6 +117,15 @@ class Pet(
 
     /** 长按回调（Service 里挂上一个「动作菜单」） */
     var onLongPress: (() -> Unit)? = null
+    /** 点一下（Service 用来统计连点 → 说一句「被戳烦了」） */
+    var onTap: (() -> Unit)? = null
+    /** 被甩出去 */
+    var onThrown: (() -> Unit)? = null
+    /** 拖拽/抛掷彻底停下来（含落到边缘吸附） */
+    var onSettled: (() -> Unit)? = null
+    /** 缩进去躲起来 / 探出来 */
+    var onHiddenChange: ((Boolean) -> Unit)? = null
+
     private var pressed = false
     private var longPressFired = false
     private val longPressRunnable = object : Runnable {
@@ -155,9 +185,17 @@ class Pet(
         }
     }
 
+    /** 实际提交给 WindowManager 的 x（含躲藏位移） */
+    private fun windowX(): Double = x + hideNowPx
+
+    /** 给台词气泡等外部定位用的窗口左边缘（含躲藏位移） */
+    val windowLeftPx: Int get() = windowX().toInt()
+
     /** 回到配置的角落（右键菜单/设置里用） */
     fun resetPosition() {
         mode = Mode.IDLE
+        snapEdge = 0
+        wake()
         body = Body(x, y, 0.0, 0.0)
         val (ax, ay) = anchorPixel()
         x = ax
@@ -166,8 +204,26 @@ class Pet(
         playIdle()
     }
 
+    /** 供 Service 摆放「第二只、第三只」：整体位移一段距离 */
+    fun shiftBy(dx: Double, dy: Double) {
+        x += dx
+        y += dy
+        clampToScreen()
+        push()
+    }
+
+    /** 初始摆放用：位移之后把「整只」夹进屏幕，保证一定看得见（物理边界允许半只出屏） */
+    fun shiftByVisible(dx: Double, dy: Double) {
+        x += dx
+        y += dy
+        val dm = context.resources.displayMetrics
+        x = x.coerceIn(0.0, (dm.widthPixels - sizePx).coerceAtLeast(0).toDouble())
+        y = y.coerceIn(0.0, (dm.heightPixels - heightPx).coerceAtLeast(0).toDouble())
+        push()
+    }
+
     private fun push() {
-        onMove(x.toInt(), y.toInt(), sizePx, heightPx)
+        onMove(windowX().toInt(), y.toInt(), sizePx, heightPx)
     }
 
     /** 外部（Service）把窗口加上去之后调用一次，把当前位置同步给 WindowManager */
@@ -177,6 +233,62 @@ class Pet(
         val b = bounds()
         x = x.coerceIn(b.minX, b.maxX)
         y = y.coerceIn(b.minY, b.maxY)
+    }
+
+    // ---------------------------------------------------------------- 贴边躲藏
+
+    private fun hideAmountPx(): Double = sizePx * HIDE_RATIO
+
+    /** 任何一次交互都要「叫醒」她：探出来，并重置闲置计时 */
+    private fun wake() {
+        lastInteractMs = SystemClock.uptimeMillis()
+        if (hidden) setHidden(false)
+    }
+
+    private fun setHidden(on: Boolean) {
+        val want = if (on && snapEdge != 0) snapEdge * hideAmountPx() else 0.0
+        if (want == hideTargetPx) return
+        hideTargetPx = want
+        if (on != hidden) {
+            hidden = on
+            Log.i(TAG, "hide=$on offset=${want.toInt()}")
+            onHiddenChange?.invoke(on)
+        }
+    }
+
+    /**
+     * 松手/落地后判断：贴着左右边缘就吸附过去（贴边时朝向屏幕内侧）。
+     * 这是桌宠的常见行为——往边上一丢，她就自己靠过去，闲置一会儿还会缩起来。
+     */
+    private fun snapIfNearEdge() {
+        lastInteractMs = SystemClock.uptimeMillis()
+        if (!allowEdgeHide) {
+            snapEdge = 0
+            setHidden(false)
+            return
+        }
+        val dm = context.resources.displayMetrics
+        val w = dm.widthPixels.toDouble()
+        val slop = SNAP_SLOP_DP * density
+        val leftGap = x
+        val rightGap = w - (x + sizePx)
+        val edge = when {
+            leftGap <= slop -> -1
+            rightGap <= slop -> 1
+            else -> 0
+        }
+        if (edge == 0) {
+            snapEdge = 0
+            setHidden(false)
+            return
+        }
+        snapEdge = edge
+        x = if (edge < 0) 0.0 else w - sizePx
+        facing = if (edge < 0) 1 else -1
+        forcedNoMirror = false
+        Log.i(TAG, "snap edge=$edge x=${x.toInt()}")
+        push()
+        canvasView.invalidate()
     }
 
     // ---------------------------------------------------------------- 动画播放
@@ -296,10 +408,12 @@ class Pet(
         }
     }
 
-    /** 漫游：朝当前朝向走一段（距离按 size/462 等比缩放），出界则退回待机 */
+    /** 漫游：朝当前朝向走一段（距离按 size/462 等比缩放），越界则夹回可走范围 */
     private fun playMove() {
         Log.i(TAG, "-> playMove")
         if (cfg.moves.isEmpty()) { playIdle(); return }
+        // 缩在屏幕边上时不要乱走，否则会「半只身子悬在屏幕中间」
+        if (hidden || hideTargetPx != 0.0) { playIdle(); return }
         val act = cfg.moves.random()
         val scale = sizePx / PetConfig.PET_REF_WIDTH
         val dist = Random.nextDouble(act.minDist, max(act.maxDist, act.minDist + 1.0)) * scale
@@ -336,6 +450,8 @@ class Pet(
             x = moveToX
             push()
             mode = Mode.IDLE
+            // 走完再判一次贴边：走过来正好停在边上就自己靠过去
+            snapIfNearEdge()
             scheduleNext()
         }
     }
@@ -364,7 +480,9 @@ class Pet(
 
     private fun onTap() {
         Log.i(TAG, "-> onTap")
+        wake()
         squash(Physics.SQ_SQUASH)
+        onTap?.invoke()
         if (cfg.clicks.isEmpty()) { playIdle(); return }
         mode = Mode.IDLE
         forcedNoMirror = false
@@ -401,7 +519,9 @@ class Pet(
                 push()
                 if (r.atRest) {
                     mode = Mode.IDLE
+                    snapIfNearEdge()
                     playIdle()
+                    onSettled?.invoke()
                 } else {
                     active = true
                 }
@@ -418,6 +538,32 @@ class Pet(
                 active = p < 1.0
             }
             Mode.IDLE -> {}
+        }
+
+        // 贴边躲藏：先按当前位置重新判定贴边状态。
+        // 不能只信 snapEdge——松手贴边后又被拖走时它会过期，过期会导致在屏幕中间缩出去。
+        if (!dragging) {
+            val dm = context.resources.displayMetrics
+            val slop = SNAP_SLOP_DP * density
+            val near = when {
+                x <= slop -> -1
+                dm.widthPixels - (x + sizePx) <= slop -> 1
+                else -> 0
+            }
+            if (near != snapEdge) {
+                snapEdge = near
+                if (near == 0 && hidden) setHidden(false)
+            }
+        }
+        // 闲置够久 → 缩进去；位移每帧平滑逼近目标
+        if (allowEdgeHide && !hidden && snapEdge != 0 && now - lastInteractMs > HIDE_DELAY_MS) {
+            setHidden(true)
+        }
+        if (hideNowPx != hideTargetPx) {
+            val diff = hideTargetPx - hideNowPx
+            hideNowPx = if (abs(diff) < 1.0) hideTargetPx else hideNowPx + diff * HIDE_LERP
+            push()
+            active = true
         }
 
         if (squashActive) {
@@ -440,6 +586,7 @@ class Pet(
         val (ax, ay) = anchorPixel()
         x = ax
         y = ay
+        lastInteractMs = SystemClock.uptimeMillis()
         push()
         playIdle()
     }
@@ -452,6 +599,7 @@ class Pet(
 
     /** 点播指定动画（长按动作菜单用），播完自动回到随机链 */
     fun playAction(slug: String) {
+        wake()
         mode = Mode.IDLE
         dragging = false
         pressed = false
@@ -519,11 +667,12 @@ class Pet(
             val rawY = event.rawY.toDouble()
             when (event.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
-                    Log.i(TAG, "-> down raw=(${rawX.toInt()},${rawY.toInt()}) pet=(${this@Pet.x.toInt()},${this@Pet.y.toInt()})")
+                    Log.i(TAG, "-> down raw=(${rawX.toInt()},${rawY.toInt()}) win=(${windowX().toInt()},${y.toInt()})")
+                    wake()
                     downRawX = rawX
                     downRawY = rawY
                     downAtMs = nowMs()
-                    grabDX = rawX - this@Pet.x
+                    grabDX = rawX - windowX()
                     grabDY = rawY - this@Pet.y
                     dragging = false
                     pressed = true
@@ -549,13 +698,16 @@ class Pet(
                     }
                     if (dragging) {
                         mode = Mode.DRAG
-                        dragTargetX = rawX - grabDX
+                        // 从「缩进去」的状态拖出来时要把当前躲藏位移算进去：
+                        // 视觉位置 = x + hideNowPx，光动 x 会让她一边探出一边跑偏
+                        dragTargetX = rawX - grabDX - hideNowPx
                         dragTargetY = rawY - grabDY
                         dragVX = 0.0
                         dragVY = 0.0
                         // 拖动中让动画跟着朝向走
-                        if (dragTargetX > this@Pet.x + 2) { facing = 1; forcedNoMirror = false }
-                        else if (dragTargetX < this@Pet.x - 2) { facing = -1; forcedNoMirror = false }
+                        val wx = windowX()
+                        if (dragTargetX > wx + 2) { facing = 1; forcedNoMirror = false }
+                        else if (dragTargetX < wx - 2) { facing = -1; forcedNoMirror = false }
                     }
                     return true
                 }
@@ -570,6 +722,12 @@ class Pet(
                         dragging = false
                         return true
                     }
+                    // 拖拽结束时把残余的躲藏位移并进 x，避免松手后她自己往边上滑
+                    if (dragging && hideNowPx != 0.0) {
+                        this@Pet.x += hideNowPx
+                        hideNowPx = 0.0
+                        hideTargetPx = 0.0
+                    }
                     if (!dragging) {
                         Sfx.release()
                         onTap()
@@ -578,9 +736,12 @@ class Pet(
                         val v = Physics.estimateReleaseVelocity(trimmed, now, cfg.physics)
                         if (v == null) {
                             mode = Mode.IDLE
+                            snapIfNearEdge()
                             playIdle()
+                            onSettled?.invoke()
                         } else {
                             startThrow(v.first, v.second)
+                            onThrown?.invoke()
                         }
                     }
                     dragging = false

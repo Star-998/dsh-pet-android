@@ -11,6 +11,8 @@
     <!-- 开机自启（可选，由用户在设置里开） -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <!-- 不需要网络：本 app 完全离线（无 AI、无余额查询） -->
+    <!-- 后台保活：申请「忽略电池优化」，减少省电策略把宠物杀掉 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <application
         android:name=".App"
@@ -29,6 +31,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".LinesActivity"
+            android:exported="false"
+            android:label="@string/lines_editor_title"
+            android:windowSoftInputMode="adjustResize" />
 
         <service
             android:name=".PetService"
