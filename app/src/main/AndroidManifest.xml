@@ -10,7 +10,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- 开机自启（可选，由用户在设置里开） -->
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <!-- 不需要网络：本 app 完全离线（无 AI、无余额查询） -->
+
+    <!-- ↓↓↓ AI Agent 新增 ↓↓↓ -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- ↑↑↑ AI Agent 新增 ↑↑↑ -->
+
     <!-- 后台保活：申请「忽略电池优化」，减少省电策略把宠物杀掉 -->
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
@@ -31,6 +35,49 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- ↓↓↓ AI Agent 新增：全屏对话页 ↓↓↓ -->
+        <activity
+            android:name=".AgentActivity"
+            android:exported="false"
+            android:label="@string/agent_service_name"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+
+        <activity
+            android:name=".AiSettingsActivity"
+            android:exported="false"
+            android:label="AI / Agent 设置"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- 桌面上多一个「大肥鱼助手」图标，点它直接开全屏对话 -->
+        <activity-alias
+            android:name=".AgentShortcut"
+            android:exported="true"
+            android:icon="@drawable/ic_launcher"
+            android:label="大肥鱼助手"
+            android:targetActivity=".AgentActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- 无障碍服务：看屏幕 + 点按钮，全靠它。开关由用户在系统设置里手动打开 -->
+        <service
+            android:name=".AgentService"
+            android:exported="true"
+            android:label="@string/agent_service_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/agent_service_config" />
+        </service>
+        <!-- ↑↑↑ AI Agent 新增 ↑↑↑ -->
 
         <activity
             android:name=".LinesActivity"
