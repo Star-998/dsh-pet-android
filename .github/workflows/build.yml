@@ -8,6 +8,10 @@ on:
 permissions:
   contents: write
 
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -28,11 +32,31 @@ jobs:
       - name: 安装 ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: 安装 Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: 安装 SDK 组件
-        run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+      # 不用 android-actions/setup-android：它会去装一个已从仓库下架的旧包 `tools`，
+      # 在新版 runner 上必然报 "Failed to find package 'tools'"。
+      # ubuntu-latest 镜像本身已经带了 Android SDK 和 cmdline-tools，直接用即可。
+      - name: 准备 Android SDK 组件
+        run: |
+          set -e
+          SDK="$ANDROID_SDK_ROOT"
+          echo "SDK 目录: $SDK"
+          SM="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort | tail -n 1)"
+          if [ -z "$SM" ]; then
+            echo "镜像里没有 cmdline-tools，手动下载一份"
+            mkdir -p "$SDK/cmdline-tools"
+            cd /tmp
+            curl -sSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q cmdtools.zip
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv cmdline-tools "$SDK/cmdline-tools/latest"
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "使用 sdkmanager: $SM"
+          mkdir -p "$HOME/.android"
+          touch "$HOME/.android/repositories.cfg"
+          yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+          "$SM" --sdk_root="$SDK" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          echo "sdk.dir=$SDK" > "$GITHUB_WORKSPACE/local.properties"
 
       - name: 还原素材（从上游 dsh-pet 转码）
         run: |
@@ -46,22 +70,21 @@ jobs:
           FPS: 15
 
       - name: 构建 debug APK
-        run: |
-          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
-          ./gradlew :app:assembleDebug --no-daemon
+        run: ./gradlew :app:assembleDebug --no-daemon
 
       - name: 上传 APK（Artifacts）
         uses: actions/upload-artifact@v4
         with:
-          name: dapet-ai-apk
+          name: dapet-agent-apk
           path: app/build/outputs/apk/debug/app-debug.apk
 
       - name: 发布到 Releases（手机可直接下载）
         run: |
           cp app/build/outputs/apk/debug/app-debug.apk ./大肥鱼-Agent.apk
-          gh release create "ai-${{ github.run_number }}" ./大肥鱼-Agent.apk \
+          gh release create "agent-${{ github.run_number }}" ./大肥鱼-Agent.apk \
             --title "大肥鱼桌宠 · AI Agent #${{ github.run_number }}" \
-            --notes "自动构建。安装后：1) 系统设置 → 无障碍 → 打开「大肥鱼助手」；2) 桌面「大肥鱼助手」图标 → ⚙️ 填 DeepSeek API Key；3) 长按桌宠弹出对话框，说一句话就能让她操作手机。" \
+            --notes "自动构建。安装后：1) 系统设置 → 无障碍 → 打开「大肥鱼助手」；2) 桌面「大肥鱼助手」图标 → 右上角 ⚙️ 填 DeepSeek API Key；3) 长按桌宠弹对话框，说一句话就能让她操作手机。" \
             --latest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
