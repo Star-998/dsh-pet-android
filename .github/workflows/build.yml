@@ -69,6 +69,22 @@ jobs:
           QUALITY: 50
           FPS: 15
 
+      # 原仓库 .gitignore 明确排除了第三方版权素材（鲸鱼娘立绘 + 点击音效），
+      # 所以任何新克隆的仓库都缺这 4 个资源，编译必然失败。
+      # 这里在 CI 里就地生成占位文件：能编译通过，运行不受影响。
+      - name: 补生成仓库未分发的素材占位
+        run: |
+          set -u
+          mkdir -p app/src/main/res/drawable app/src/main/res/raw
+          printf '%s' '<?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval"><gradient android:type="radial" android:gradientRadius="60%" android:startColor="#334E6BFF" android:centerColor="#1F4E6BFF" android:endColor="#00000000"/></shape>' > app/src/main/res/drawable/whale_selfie.xml
+          printf '%s' '<?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval"><gradient android:angle="135" android:startColor="#6BB6FF" android:endColor="#7A6BFF"/></shape>' > app/src/main/res/drawable/whale_cutout.xml
+          for n in tap_press tap_release; do
+            f="app/src/main/res/raw/$n.mp3"
+            ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=880:duration=0.03" -ac 1 -ar 44100 "$f" \
+              || printf '\xff\xfb\x90\x64' > "$f"
+          done
+          ls -l app/src/main/res/raw app/src/main/res/drawable
+
       - name: 构建 debug APK
         run: |
           chmod +x ./gradlew || true
