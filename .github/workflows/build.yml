@@ -1,1 +1,67 @@
+name: build-apk-agent
 
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 安装 Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件
+        run: sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: 还原素材（从上游 dsh-pet 转码）
+        run: |
+          sudo ln -sf "$(which ffmpeg)" /usr/local/bin/ffmpeg
+          chmod +x tools/fetch-and-transcode.sh
+          ./tools/fetch-and-transcode.sh
+        env:
+          # 300p / 15fps：APK 约 80MB，转码最快。想要更清晰可改成 WIDTH=480（约 277MB）
+          WIDTH: 300
+          QUALITY: 50
+          FPS: 15
+
+      - name: 构建 debug APK
+        run: |
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          ./gradlew :app:assembleDebug --no-daemon
+
+      - name: 上传 APK（Artifacts）
+        uses: actions/upload-artifact@v4
+        with:
+          name: dapet-ai-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 发布到 Releases（手机可直接下载）
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ./大肥鱼-Agent.apk
+          gh release create "ai-${{ github.run_number }}" ./大肥鱼-Agent.apk \
+            --title "大肥鱼桌宠 · AI Agent #${{ github.run_number }}" \
+            --notes "自动构建。安装后：1) 系统设置 → 无障碍 → 打开「大肥鱼助手」；2) 桌面「大肥鱼助手」图标 → ⚙️ 填 DeepSeek API Key；3) 长按桌宠弹出对话框，说一句话就能让她操作手机。" \
+            --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
