@@ -71,4 +71,7 @@
     <string name="menu_title">选择动作</string>
 
     <string name="need_overlay">还没有悬浮窗权限，先点「授权悬浮窗」。</string>
+    
+    <string name="agent_service_name">大肥鱼助手</string>
+    <string name="agent_service_desc">让大肥鱼读取屏幕内容、点击按钮、打开应用，帮你完成手机上的操作。开启后她可以「看到」屏幕并代为操作，请只在你信任的场景下使用。</string>
 </resources>
