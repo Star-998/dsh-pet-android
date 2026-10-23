@@ -282,7 +282,7 @@ class PetService : Service() {
                 }
                 pet.applyScale(sizeDp)
                 pet.allowEdgeHide = Prefs.edgeHideOn(this)
-                pet.onLongPress = { showActionMenu(pet) }
+                pet.onLongPress = { Agent.openDialog(this) }
                 pet.onTap = { onPetTapped(pet) }
                 pet.onThrown = { onPetThrown(pet) }
                 pet.onSettled = { onPetSettled(pet) }
