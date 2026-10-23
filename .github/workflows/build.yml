@@ -1,0 +1,210 @@
+name: build-apk-agent
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  ANDROID_HOME: /usr/local/lib/android/sdk
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 安装 ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      # 不用 android-actions/setup-android：它会去装一个已从仓库下架的旧包 `tools`，
+      # 在新版 runner 上必然报 "Failed to find package 'tools'"。
+      # ubuntu-latest 镜像本身已经带了 Android SDK 和 cmdline-tools，直接用即可。
+      - name: 准备 Android SDK 组件
+        run: |
+          set -e
+          SDK="$ANDROID_SDK_ROOT"
+          echo "SDK 目录: $SDK"
+          SM="$(ls -d "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort | tail -n 1)"
+          if [ -z "$SM" ]; then
+            echo "镜像里没有 cmdline-tools，手动下载一份"
+            mkdir -p "$SDK/cmdline-tools"
+            cd /tmp
+            curl -sSL -o cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q cmdtools.zip
+            rm -rf "$SDK/cmdline-tools/latest"
+            mv cmdline-tools "$SDK/cmdline-tools/latest"
+            SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          fi
+          echo "使用 sdkmanager: $SM"
+          mkdir -p "$HOME/.android"
+          touch "$HOME/.android/repositories.cfg"
+          yes | "$SM" --sdk_root="$SDK" --licenses > /dev/null 2>&1 || true
+          "$SM" --sdk_root="$SDK" --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          echo "sdk.dir=$SDK" > "$GITHUB_WORKSPACE/local.properties"
+
+      - name: 还原素材（从上游 dsh-pet 转码）
+        run: |
+          sudo ln -sf "$(which ffmpeg)" /usr/local/bin/ffmpeg
+          chmod +x tools/fetch-and-transcode.sh
+          ./tools/fetch-and-transcode.sh
+        env:
+          # 300p / 15fps：APK 约 80MB，转码最快。想要更清晰可改成 WIDTH=480（约 277MB）
+          WIDTH: 300
+          QUALITY: 50
+          FPS: 15
+
+      # 原仓库 .gitignore 明确排除了第三方版权素材（鲸鱼娘立绘 + 点击音效），
+      # 所以任何新克隆的仓库都缺这 4 个资源，编译必然失败。
+      # 这里在 CI 里就地生成占位文件：能编译通过，运行不受影响。
+      - name: 补生成仓库未分发的素材占位
+        run: |
+          set -u
+          mkdir -p app/src/main/res/drawable app/src/main/res/raw
+          printf '%s' '<?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval"><gradient android:type="radial" android:gradientRadius="60%" android:startColor="#334E6BFF" android:centerColor="#1F4E6BFF" android:endColor="#00000000"/></shape>' > app/src/main/res/drawable/whale_selfie.xml
+          printf '%s' '<?xml version="1.0" encoding="utf-8"?><shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval"><gradient android:angle="135" android:startColor="#6BB6FF" android:endColor="#7A6BFF"/></shape>' > app/src/main/res/drawable/whale_cutout.xml
+          for n in tap_press tap_release; do
+            f="app/src/main/res/raw/$n.mp3"
+            ffmpeg -hide_banner -loglevel error -y -f lavfi -i "sine=frequency=880:duration=0.03" -ac 1 -ar 44100 "$f" \
+              || printf '\xff\xfb\x90\x64' > "$f"
+          done
+          ls -l app/src/main/res/raw app/src/main/res/drawable
+
+      # 固定签名。只靠 ~/.android/debug.keystore 不够可靠（AGP 不一定认），
+      # 所以这里双管齐下：写文件 + 在 build.gradle.kts 里显式指定 signingConfigs.debug。
+      #
+      # ⚠️ keystore 以明文存在仓库里，仅供自用。若仓库公开且在意冒名发布，
+      #    改用仓库 Secret KEYSTORE_B64，并把下面 KS_B64 那几行换成：
+      #      KS_B64: ${{ secrets.KEYSTORE_B64 }}
+      - name: 写入固定签名 keystore
+        env:
+          KS_B64: |
+            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
+        run: |
+          set -e
+          mkdir -p "$HOME/.android" /tmp
+          printf '%s' "$KS_B64" | base64 -d > /tmp/dsh.keystore
+          cp /tmp/dsh.keystore "$HOME/.android/debug.keystore"
+          keytool -list -keystore /tmp/dsh.keystore -storepass android | grep -i androiddebugkey
+
+      - name: 在 build.gradle.kts 里显式指定签名
+        run: |
+          python3 - <<'PY'
+          import re
+          p = 'app/build.gradle.kts'
+          s = open(p, encoding='utf-8').read()
+          if '/tmp/dsh.keystore' not in s:
+              inject = """
+              signingConfigs {
+                  getByName("debug") {
+                      storeFile = file("/tmp/dsh.keystore")
+                      storePassword = "android"
+                      keyAlias = "androiddebugkey"
+                      keyPassword = "android"
+                  }
+              }
+          """
+              m = re.search(r'^android\s*\{', s, flags=re.M)
+              if not m:
+                  raise SystemExit('找不到 android { 块')
+              j = s.index('\n', m.start()) + 1
+              s = s[:j] + inject + s[j:]
+              open(p, 'w', encoding='utf-8').write(s)
+              print('已注入 signingConfigs')
+          else:
+              print('已存在，跳过')
+          PY
+          grep -n "dsh.keystore" app/build.gradle.kts
+
+      - name: 构建 debug APK
+        run: |
+          chmod +x ./gradlew || true
+          sh ./gradlew :app:assembleDebug --no-daemon
+
+      - name: 打印签名指纹（两次构建一致才能覆盖安装）
+        run: |
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner"
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          if [ -x "$APKSIGNER" ]; then
+            "$APKSIGNER" verify --print-certs "$APK" || true
+          else
+            echo "没有 apksigner，改用 keytool"
+            keytool -printcert -jarfile "$APK" || true
+          fi
+
+      - name: 上传 APK（Artifacts）
+        uses: actions/upload-artifact@v4
+        with:
+          name: dapet-agent-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: 发布到 Releases（手机可直接下载）
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk ./大肥鱼-Agent.apk
+          gh release create "agent-${{ github.run_number }}" ./大肥鱼-Agent.apk \
+            --title "大肥鱼桌宠 · AI Agent #${{ github.run_number }}" \
+            --notes "自动构建。安装后：1) 系统设置 → 无障碍 → 打开「大肥鱼助手」；2) 桌面「大肥鱼助手」图标 → 右上角 ⚙️ 填 DeepSeek API Key；3) 长按桌宠弹对话框，说一句话就能让她操作手机。" \
+            --latest
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
