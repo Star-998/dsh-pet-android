@@ -70,7 +70,9 @@ jobs:
           FPS: 15
 
       - name: 构建 debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon
+        run: |
+          chmod +x ./gradlew || true
+          sh ./gradlew :app:assembleDebug --no-daemon
 
       - name: 上传 APK（Artifacts）
         uses: actions/upload-artifact@v4
