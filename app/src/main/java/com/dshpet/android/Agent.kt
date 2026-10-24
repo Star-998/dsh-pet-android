@@ -758,20 +758,95 @@ object AiStore {
     // ---------------------------------------------------------------- 对话历史
 
     /** 保存最近 MAX_HISTORY 条消息 */
+    /**
+     * 清洗消息序列，保证 tool 消息和 assistant 的 tool_calls 严格配对。
+     *
+     * 这是「工具调用失败 400」的根因：
+     * 历史只留最近 N 条，截断位置如果落在 assistant(带 tool_calls) 和它的 tool 之间，
+     * 恢复后就会出现孤儿 tool 消息，服务端直接拒：
+     *   "Messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+     *
+     * 两条规则：
+     *  1. 找不到前驱 tool_calls 的 tool 消息 → 丢弃
+     *  2. tool_calls 没被完整回应完就来了新消息 → 把这个 tool_calls 摘掉
+     */
+    fun sanitize(src: JSONArray): JSONArray {
+        val out = JSONArray()
+        var expectIds = HashSet<String>()
+        var ownerIdx = -1
+
+        fun flush() {
+            if (ownerIdx >= 0 && expectIds.isNotEmpty()) {
+                out.optJSONObject(ownerIdx)?.remove("tool_calls")
+            }
+            expectIds = HashSet()
+            ownerIdx = -1
+        }
+
+        for (i in 0 until src.length()) {
+            val m = src.optJSONObject(i) ?: continue
+            when (m.optString("role")) {
+                "tool" -> {
+                    val id = m.optString("tool_call_id").orEmpty()
+                    if (id.isNotEmpty() && expectIds.contains(id)) {
+                        out.put(m)
+                        expectIds.remove(id)
+                        if (expectIds.isEmpty()) {
+                            expectIds = HashSet()
+                            ownerIdx = -1
+                        }
+                    }
+                    // 孤儿 tool：直接丢
+                }
+                "assistant" -> {
+                    flush()
+                    val tc = m.optJSONArray("tool_calls")
+                    out.put(m)
+                    if (tc != null && tc.length() > 0) {
+                        ownerIdx = out.length() - 1
+                        val ids = HashSet<String>()
+                        for (k in 0 until tc.length()) {
+                            val c = tc.optJSONObject(k) ?: continue
+                            val cid = c.optString("id").orEmpty()
+                            if (cid.isNotEmpty()) ids.add(cid)
+                        }
+                        if (ids.isEmpty()) {
+                            m.remove("tool_calls")
+                            ownerIdx = -1
+                        } else {
+                            expectIds = ids
+                        }
+                    }
+                }
+                else -> {
+                    // user / system：会打断配对
+                    flush()
+                    out.put(m)
+                }
+            }
+        }
+        flush()
+        return out
+    }
+
     fun saveHistory(ctx: Context, messages: JSONArray) {
         try {
-            val keep = JSONArray()
-            val from = (messages.length() - MAX_HISTORY).coerceAtLeast(0)
-            for (i in from until messages.length()) {
-                val m = messages.optJSONObject(i) ?: continue
-                val role = m.optString("role")
-                // system 每轮都会重新拼，不占额度
-                if (role == "system") continue
-                if (role == "tool" || role == "assistant") {
-                    keep.put(m)
-                } else if (role == "user") {
-                    keep.put(m)
+            // 先修结构，再截断，最后再修一次（截断本身可能又切坏配对）
+            var arr = sanitize(messages)
+            val from = (arr.length() - MAX_HISTORY).coerceAtLeast(0)
+            if (from > 0) {
+                val keep0 = JSONArray()
+                for (i in from until arr.length()) {
+                    keep0.put(arr.optJSONObject(i) ?: continue)
                 }
+                arr = sanitize(keep0)
+            }
+            val keep = JSONArray()
+            for (i in 0 until arr.length()) {
+                val m = arr.optJSONObject(i) ?: continue
+                // system 每轮都会重新拼，不占额度
+                if (m.optString("role") == "system") continue
+                keep.put(m)
             }
             ctx.openFileOutput(HISTORY_FILE, Context.MODE_PRIVATE).use {
                 it.write(keep.toString().toByteArray(Charsets.UTF_8))
@@ -2163,7 +2238,8 @@ object AgentRunner {
         fun load(ctx: Context) {
             if (loaded) return
             loaded = true
-            val old = AiStore.loadHistory(ctx)
+            // 磁盘上的历史可能是旧版本写坏的，加载时统一清洗一遍
+            val old = AiStore.sanitize(AiStore.loadHistory(ctx))
             for (i in 0 until old.length()) {
                 messages.put(old.optJSONObject(i) ?: continue)
             }
@@ -2206,7 +2282,7 @@ object AgentRunner {
         while (rounds++ < 12) {
             val body = JSONObject().apply {
                 put("model", model)
-                put("messages", session.messages)
+                put("messages", AiStore.sanitize(session.messages))
                 put("tools", AgentTools.schema())
                 put("tool_choice", "auto")
                 put("temperature", AiPrefs.temperature(ctx).toDouble())
@@ -4271,6 +4347,24 @@ class AiSettingsActivity : Activity() {
                 setMargins(dp(6f), 0, 0, 0)
             })
 
+            row.addView(smallBtn("修历史") {
+                // 磁盘上的旧历史可能已经坏了（孤儿 tool 消息），
+                // 会导致之后每一轮都 400。点这里清掉重来。
+                Thread {
+                    val before = AiStore.loadHistory(this@AiSettingsActivity).length()
+                    val fixed = AiStore.sanitize(AiStore.loadHistory(this@AiSettingsActivity))
+                    AiStore.saveHistory(this@AiSettingsActivity, fixed)
+                    runOnUiThread {
+                        Toast.makeText(
+                            this@AiSettingsActivity,
+                            "已修复：清理前 $before 条，清理后 " + fixed.length() + " 条",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }.start()
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(6f), 0, 0, 0)
+            })
             row.addView(smallBtn("诊断") {
                 val r = buildDiagnoseReport()
                 showDetails("运行诊断", r)
