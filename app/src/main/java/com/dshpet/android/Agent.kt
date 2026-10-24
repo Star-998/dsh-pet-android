@@ -2216,11 +2216,11 @@ object AgentRunner {
 
             val resp = try {
                 DsNet.post(ctx, path, body)
-            } catch (t: Throwable) {
+            } catch (toolErr: Throwable) {
                 // 带 tools 的请求被拒（422/400）：多半是模型不吃这套工具格式。
                 // 降级成不带工具的纯聊天再问一次，至少别让用户看到崩溃。
                 AgentRunner.lastDegraded = true
-                AgentRunner.lastError = DsNet.friendly(t)
+                AgentRunner.lastError = DsNet.friendly(toolErr)
                 if (rounds == 1) {
                     // 降级后必须告诉用户「我现在动不了手机」。
                     // 之前静默降级，模型拿不到工具就自己编一段「已经打开啦」，
@@ -2242,12 +2242,12 @@ object AgentRunner {
                             ?.optString("content")?.trim().orEmpty()
                         val body = if (t.isEmpty()) "（模型没返回内容）" else t
                         return "⚠️ 工具调用失败，我现在动不了手机，下面只是普通聊天：\n\n" +
-                            DsNet.friendly(t) + "\n\n" + body
+                            DsNet.friendly(toolErr) + "\n\n" + body
                     } catch (t2: Throwable) {
                         return "⚠️ 接不上模型：" + DsNet.friendly(t2)
                     }
                 }
-                return "⚠️ 工具调用失败：" + DsNet.friendly(t)
+                return "⚠️ 工具调用失败：" + DsNet.friendly(toolErr)
             }
 
             val msg = resp.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
