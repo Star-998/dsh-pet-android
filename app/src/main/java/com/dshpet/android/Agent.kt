@@ -512,7 +512,7 @@ object DsNet {
         val head = when (code) {
             400 -> "请求参数不对（400）：最常见是「模型和音色不匹配」，比如 Cherry 只能配 qwen3-tts-*，配到 qwen-audio-* 上就会被拒"
             422 -> "请求参数不对（422）：通常是消息格式有问题，或模型名 / max_tokens 越界"
-            401 -> "API Key 不对、没填或已被删除（401）"
+            401 -> "API Key 不对、没填或已被删除（401）。最常见是填错服务商：百炼和硅基流动的 Key 不通用，别把视觉那个直接拿来用"
             402 -> "账户余额不足，去充值（402）"
             403 -> "没有权限调用这个模型（403）"
             404 -> "地址不对，通常是 Base URL 或接口路径拼错（404）"
@@ -1115,19 +1115,48 @@ object Voice {
         }
     }
 
-    private fun downloadTo(urlStr: String, f: java.io.File) {
-        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
-            connectTimeout = 15_000
-            readTimeout = 60_000
+    /**
+     * 百炼返回的音频地址是 http:// 明文，Android 9+ 默认禁止明文流量
+     * （会报 Cleartext HTTP traffic not permitted），所以这里强制升成 https。
+     * OSS 两边都支持，不会因为换协议而失效。
+     */
+    private fun downloadTo(urlStr0: String, f: java.io.File) {
+        val urlStr = if (urlStr0.startsWith("http://", true)) {
+            "https" + urlStr0.substring(4)
+        } else {
+            urlStr0
         }
-        try {
-            conn.inputStream.use { inp ->
-                f.outputStream().use { out -> inp.copyTo(out) }
+        var lastErr: Throwable? = null
+        // 升 https 失败就退回 http 再试一次（配合 manifest 里的明文开关）
+        for (u in listOf(urlStr, urlStr0).distinct()) {
+            try {
+                val conn = (URL(u).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15_000
+                    readTimeout = 60_000
+                    setRequestProperty("Accept", "audio/*,*/*")
+                }
+                try {
+                    val code = conn.responseCode
+                    if (code !in 200..299) {
+                        throw RuntimeException("下载音频失败（HTTP $code）")
+                    }
+                    conn.inputStream.use { inp ->
+                        f.outputStream().use { out -> inp.copyTo(out) }
+                    }
+                } finally {
+                    conn.disconnect()
+                }
+                if (f.length() > 256) return
+                lastErr = RuntimeException("下载到的文件太小（" + f.length() + " 字节）")
+            } catch (t: Throwable) {
+                lastErr = t
             }
-        } finally {
-            conn.disconnect()
         }
+        throw RuntimeException(
+            "音频下载失败：" + (lastErr?.message ?: "未知原因") +
+                "｜合成其实成功了，只是取不回音频文件",
+        )
     }
 
     /** 手写 multipart/form-data（零第三方依赖） */
@@ -4508,6 +4537,12 @@ class AiSettingsActivity : Activity() {
         dlg.show()
     }
 
+    /** Key 指纹：只显示前 6 位和长度，既能核对又不泄露 */
+    private fun fp(k: String): String {
+        if (k.isBlank()) return "（未填）"
+        return k.take(6) + "…（共 " + k.length + " 位）"
+    }
+
     /** 跑一遍关键状态，输出成可复制的纯文本 */
     private fun buildDiagnoseReport(): String {
         val b = StringBuilder()
@@ -4547,6 +4582,11 @@ class AiSettingsActivity : Activity() {
         line("视觉端点", AiPrefs.visionBase(this))
         line("视觉模型", AiPrefs.visionModel(this).ifBlank { "（自动探测）" })
         line("语音服务商", AiPrefs.voiceProvider(this))
+        // Key 指纹：百炼和硅基流动的 Key 前缀不一样，看一眼就知道有没有填串
+        line("主对话 Key", AiPrefs.maskedKey(this))
+        line("视觉 Key", fp(AiPrefs.visionKey(this)))
+        line("识别 Key", fp(AiPrefs.asrKey(this)))
+        line("朗读 Key", fp(AiPrefs.ttsKey(this)))
         line("朗读已配置", AiPrefs.ttsReady(this))
         line("主对话 Key 已填", AiPrefs.hasKey(this))
         return b.toString()
