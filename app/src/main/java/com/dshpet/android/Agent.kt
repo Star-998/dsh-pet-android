@@ -510,12 +510,12 @@ object DsNet {
             }
         }
         val head = when (code) {
+            400 -> "请求参数不对（400）：最常见是「模型和音色不匹配」，比如 Cherry 只能配 qwen3-tts-*，配到 qwen-audio-* 上就会被拒"
             422 -> "请求参数不对（422）：通常是消息格式有问题，或模型名 / max_tokens 越界"
             401 -> "API Key 不对、没填或已被删除（401）"
-            402 -> "账户余额不足，去 platform.deepseek.com 充值（402）"
+            402 -> "账户余额不足，去充值（402）"
             403 -> "没有权限调用这个模型（403）"
             404 -> "地址不对，通常是 Base URL 或接口路径拼错（404）"
-            422 -> "请求参数不对，检查模型名 / max_tokens（422）"
             429 -> "请求太频繁被限流，稍等一下（429）"
             500, 502, 503 -> "服务端开小差了（$code），稍后再试"
             else -> "请求失败（HTTP $code）"
@@ -1058,10 +1058,33 @@ object Voice {
             })
         }
         val raw = DsNet.postRaw(url, AiPrefs.ttsKey(ctx), body, 60_000)
+        rememberRaw(raw)
         val o = JSONObject(raw)
         val u = o.optJSONObject("output")?.optJSONObject("audio")?.optString("url").orEmpty()
-        if (u.isBlank()) throw RuntimeException("百炼没返回音频地址：" + raw.take(160))
+        if (u.isBlank()) {
+            val msg = o.optString("message").ifBlank { o.optString("code") }.ifBlank { raw }
+            throw RuntimeException("百炼没返回音频地址：$msg")
+        }
         onUrl(u)
+    }
+
+    /** 上次发出的请求内容（脱敏），贴在错误详情里 */
+    @Volatile
+    var lastRequest: String = ""
+
+    private fun buildDebugLog(ctx: Context, text: String): String {
+        val prov = AiPrefs.voiceProvider(ctx)
+        return buildString {
+            append("服务商：").append(prov).append('\n')
+            append("朗读模型：").append(AiPrefs.ttsModel(ctx)).append('\n')
+            append("音色：").append(AiPrefs.ttsVoice(ctx)).append('\n')
+            append("地址：").append(AiPrefs.ttsBase(ctx)).append('\n')
+            append("文本长度：").append(text.length).append('\n')
+            if (prov == "dashscope") {
+                append("实际端点：").append(originOf(AiPrefs.ttsBase(ctx)))
+                    .append("/api/v1/services/audio/tts/SpeechSynthesizer")
+            }
+        }
     }
 
     private fun downloadTo(urlStr: String, f: java.io.File) {
@@ -1189,12 +1212,22 @@ object Voice {
             true
         } catch (t: Throwable) {
             lastTtsError = t.message ?: t.javaClass.simpleName
+            lastRequest = buildDebugLog(ctx, speak)
             false
         }
     }
 
     @Volatile
     var lastTtsError: String? = null
+
+    /** 上一次合成/识别的完整原始报文，排查用 */
+    @Volatile
+    var lastRaw: String = ""
+
+    /** 记录一次请求原文，方便把 400 的真实原因贴出来 */
+    private fun rememberRaw(raw: String) {
+        lastRaw = raw.take(1200)
+    }
 
     private fun play(ctx: Context, f: java.io.File) {
         Handler(Looper.getMainLooper()).post {
@@ -1344,6 +1377,34 @@ class AgentService : AccessibilityService() {
         private var lastShotMs = 0L
 
         fun isEnabled(): Boolean = instance != null
+
+        /**
+         * 系统设置里是否把本服务列在「已启用」列表里。
+         * 注意它和 isEnabled() 不是一回事：
+         * 设置里开了 ≠ 服务真的连上了。Android 经常出现「开关是开的、但服务没起来」，
+         * 表现就是设置页显示已开启、但动不了手机。这种情况只能让用户在系统里关一下再开。
+         */
+        fun enabledInSettings(ctx: Context): Boolean {
+            return try {
+                val want = ctx.packageName + "/" + AgentService::class.java.name
+                val s = android.provider.Settings.Secure.getString(
+                    ctx.contentResolver,
+                    android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                ).orEmpty()
+                s.split(':').any { it.equals(want, ignoreCase = true) }
+            } catch (_: Throwable) {
+                false
+            }
+        }
+
+        /** 服务连上了，但当前拿不到任何窗口 —— 也是「动不了」的常见原因 */
+        fun rootOk(): Boolean {
+            return try {
+                instance?.rootInActiveWindow != null || instance?.windows?.isNotEmpty() == true
+            } catch (_: Throwable) {
+                false
+            }
+        }
     }
 
     override fun onServiceConnected() {
@@ -3915,7 +3976,16 @@ class AiSettingsActivity : Activity() {
             edTtsModel = edit(AiPrefs.ttsModel(this))
             edTtsModel.hint = "朗读模型，默认 FunAudioLLM/CosyVoice2-0.5B"
             edTtsVoice = edit(AiPrefs.ttsVoice(this))
-            edTtsVoice.hint = "音色，例 FunAudioLLM/CosyVoice2-0.5B:anna"
+            edTtsVoice.hint = "音色。硅基流动填 FunAudioLLM/CosyVoice2-0.5B:anna；百炼配 qwen3-tts-* 填 Cherry"
+            // 模型和音色必须配套，给一行提醒，免得又是 400
+            body.addView(
+                TextView(this).apply {
+                    text = "⚠️ 音色要和模型配套：Cherry 只能配 qwen3-tts-*；qwen-audio-* 系列要用 longanhuan_v3 这类音色，混着用会报 400。"
+                    setTextColor(0xFF8A7A5A.toInt())
+                    textSize = 10f
+                    setPadding(dp(2f), dp(2f), dp(2f), dp(4f))
+                },
+            )
 
             val rowVoice = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -3940,16 +4010,18 @@ class AiSettingsActivity : Activity() {
                 AiPrefs.setVoiceProvider(this@AiSettingsActivity, voiceProv)
                 paintProvButtons()
                 edAsrBase.setText("https://dashscope.aliyuncs.com/compatible-mode/v1")
+                // 必须用非流式版本；带 -streaming 的是 WebSocket 协议，走不了 HTTP
                 edAsrModel.setText("qwen-audio-asr-flash")
                 edTtsBase.setText("https://dashscope.aliyuncs.com")
-                edTtsModel.setText("qwen-audio-3.0-tts-plus")
+                // Cherry 是 qwen3-tts 的音色，配 qwen-audio-* 会被拒（400）
+                edTtsModel.setText("qwen3-tts-flash")
                 edTtsVoice.setText("Cherry")
                 if (edAsrKey.text.isBlank() && AiPrefs.visionKey(this@AiSettingsActivity).isNotBlank()) {
                     edAsrKey.setText(AiPrefs.visionKey(this@AiSettingsActivity))
                     edTtsKey.setText(AiPrefs.visionKey(this@AiSettingsActivity))
                     Toast.makeText(
                         this@AiSettingsActivity,
-                        "模板已填，Key 沿用了视觉那个，确认下是不是百炼的 Key",
+                        "已填：识别 qwen-audio-asr-flash / 朗读 qwen3-tts-flash+Cherry。Key 沿用了视觉那个，确认下是不是百炼的",
                         Toast.LENGTH_LONG,
                     ).show()
                 } else {
@@ -3992,9 +4064,21 @@ class AiSettingsActivity : Activity() {
                     runOnUiThread {
                         Toast.makeText(
                             this@AiSettingsActivity,
-                            if (ok) "播放中，听听效果" else "合成失败：" + (Voice.lastTtsError ?: "未知原因"),
+                            if (ok) "播放中，听听效果" else "合成失败，点右上角看详情",
                             Toast.LENGTH_LONG,
                         ).show()
+                        if (!ok) {
+                            val detail = buildString {
+                                append("错误信息：\n").append(Voice.lastTtsError ?: "未知").append("\n\n")
+                                if (Voice.lastRequest.isNotBlank()) {
+                                    append("本次请求：\n").append(Voice.lastRequest).append("\n\n")
+                                }
+                                if (Voice.lastRaw.isNotBlank()) {
+                                    append("服务端原文：\n").append(Voice.lastRaw)
+                                }
+                            }
+                            showDetails("语音合成失败", detail)
+                        }
                     }
                 }.start()
             }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
@@ -4084,6 +4168,12 @@ class AiSettingsActivity : Activity() {
                 setMargins(dp(6f), 0, 0, 0)
             })
 
+            row.addView(smallBtn("诊断") {
+                val r = buildDiagnoseReport()
+                showDetails("运行诊断", r)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(6f), 0, 0, 0)
+            })
             row.addView(smallBtn("重置对话") {
                 AiStore.clearHistory(this@AiSettingsActivity)
                 Toast.makeText(this@AiSettingsActivity, "已清空保存的对话记录", Toast.LENGTH_SHORT).show()
@@ -4310,6 +4400,94 @@ class AiSettingsActivity : Activity() {
                 Toast.LENGTH_SHORT,
             ).show()
         }
+    }
+
+    /**
+     * 详情对话框：Toast 装不下、也看不全的东西都走这里。
+     * 内容可滚动、可长按全选，另外给一个「复制」按钮。
+     */
+    private fun showDetails(title: String, content: String) {
+        val d = resources.displayMetrics.density
+        fun dp(v: Float) = (v * d).roundToInt()
+        val tv = android.widget.EditText(this).apply {
+            setText(content)
+            setTextColor(0xFFEAF1F8.toInt())
+            setBackgroundColor(0xFF151A22.toInt())
+            textSize = 11f
+            setSingleLine(false)
+            isFocusableInTouchMode = true
+            setPadding(dp(12f), dp(10f), dp(12f), dp(10f))
+            setTextIsSelectable(true)
+        }
+        val sv = ScrollView(this).apply {
+            addView(tv)
+            setPadding(dp(8f), dp(6f), dp(8f), dp(6f))
+        }
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(0xFF0E1117.toInt())
+            setPadding(dp(10f), dp(4f), dp(10f), dp(4f))
+            addView(sv, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                dp(320f),
+            ))
+        }
+        val dlg = android.app.AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(box)
+            .setPositiveButton("复制全部") { _, _ ->
+                val cm = getSystemService(android.content.Context.CLIPBOARD_SERVICE)
+                    as? android.content.ClipboardManager
+                cm?.setPrimaryClip(android.content.ClipData.newPlainText("dsh-error", content))
+                Toast.makeText(this, "已复制", Toast.LENGTH_SHORT).show()
+            }
+            .setNegativeButton("关闭", null)
+            .create()
+        dlg.show()
+    }
+
+    /** 跑一遍关键状态，输出成可复制的纯文本 */
+    private fun buildDiagnoseReport(): String {
+        val b = StringBuilder()
+        fun line(k: String, v: Any) { b.append(k).append("：").append(v).append('\n') }
+
+        line("无障碍·设置里已开启", AgentService.enabledInSettings(this))
+        line("无障碍·服务已连接", AgentService.isEnabled())
+        line("无障碍·能拿到窗口", AgentService.rootOk())
+        b.append('\n')
+        if (AgentService.enabledInSettings(this) && !AgentService.isEnabled()) {
+            b.append("⚠️ 典型的「开关开着但服务没起来」。\n")
+            b.append("去系统设置把「大肥鱼助手」关掉，再打开一次就好。\n")
+            b.append("（装新版、授权新权限后 Android 常会这样）\n\n")
+        }
+        if (AgentService.isEnabled() && !AgentService.rootOk()) {
+            b.append("⚠️ 服务连着但读不到窗口。锁屏再亮一下通常能恢复。\n\n")
+        }
+
+        val overlay = if (Build.VERSION.SDK_INT >= 23) {
+            android.provider.Settings.canDrawOverlays(this)
+        } else {
+            true
+        }
+        line("悬浮窗权限", overlay)
+        if (!overlay) b.append("⚠️ 没给悬浮窗权限，长按桌宠弹不出对话框。\n\n")
+
+        val mic = if (Build.VERSION.SDK_INT >= 23) {
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+        line("录音权限", mic)
+        line("识别引擎可用", Voice.available(this))
+
+        b.append('\n')
+        line("视觉端点", AiPrefs.visionBase(this))
+        line("视觉模型", AiPrefs.visionModel(this).ifBlank { "（自动探测）" })
+        line("语音服务商", AiPrefs.voiceProvider(this))
+        line("朗读已配置", AiPrefs.ttsReady(this))
+        line("主对话 Key 已填", AiPrefs.hasKey(this))
+        return b.toString()
     }
 
     /** 重画服务商按钮的选中态 */
