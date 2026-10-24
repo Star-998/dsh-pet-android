@@ -1007,38 +1007,62 @@ object Voice {
      * 要走 /chat/completions，把音频塞进 input_audio 的 data URI。
      */
     private fun asrDashScope(ctx: Context, file: java.io.File): String? {
-        val base0 = AiPrefs.asrBase(ctx).trimEnd('/')
-        val base = if (base0.endsWith("/v1")) base0 else base0 + "/v1"
-        val url = base + "/chat/completions"
+        val url = originOf(AiPrefs.asrBase(ctx)) +
+            "/api/v1/services/aigc/multimodal-generation/generation"
         val b64 = android.util.Base64.encodeToString(
             file.readBytes(),
             android.util.Base64.NO_WRAP,
         )
         val dataUri = "data:audio/mp4;base64,$b64"
+        // 百炼 ASR 是自己的协议：{ model, input:{messages:[...]}, parameters:{...} }
         val body = JSONObject().apply {
             put("model", AiPrefs.asrModel(ctx))
-            put("stream", false)
-            put("messages", JSONArray().apply {
+            put("input", JSONObject().put("messages", JSONArray().apply {
                 put(JSONObject().put("role", "user").put("content", JSONArray().apply {
                     put(JSONObject().put("type", "input_audio").put("input_audio", JSONObject().apply {
                         put("data", dataUri)
-                        put("format", "mp4")
                     }))
                 }))
-            })
-            put("asr_options", JSONObject().put("enable_itn", false))
+            }))
+            put("parameters", JSONObject().put("enable_itn", false))
         }
-        val raw = DsNet.postRaw(url, AiPrefs.asrKey(ctx), body, 90_000)
-        return DsNet.extractContent(
-            JSONObject(raw).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message"),
-        ).trim().ifBlank { null }
+        val raw = try {
+            DsNet.postRaw(url, AiPrefs.asrKey(ctx), body, 90_000)
+        } catch (t: Throwable) {
+            throw RuntimeException("识别请求失败：${'$'}{t.message ?: ""}")
+        }
+        rememberRaw(raw)
+        // 返回形如 output.choices[0].message.content[0].text
+        val o = JSONObject(raw)
+        val txt = o.optJSONObject("output")
+            ?.optJSONArray("choices")
+            ?.optJSONObject(0)
+            ?.optJSONObject("message")
+            ?.optJSONArray("content")
+            ?.optJSONObject(0)
+            ?.optString("text")
+            .orEmpty()
+            .ifBlank { o.optJSONObject("output")?.optString("text").orEmpty() }
+        return txt.trim().ifBlank { null }
     }
 
-    /** 取 https://host，丢掉路径。百炼 TTS 的原生端点挂在根域名下 */
+    /**
+     * 把用户填的地址规范成 https://host。
+     * 百炼的 WebSocket 地址（wss://xxx/api-ws/v1/inference）不能直接拼 HTTP 路径，
+     * 会变成 wss://.../api/v1/... 然后报 "unknown protocol: wss"，
+     * 所以这里强制换成 https 并丢掉路径。
+     */
     private fun originOf(base: String): String {
-        val b = base.trim().trimEnd('/')
+        var b = base.trim().trimEnd('/')
+        when {
+            b.startsWith("wss://", true) -> b = "https" + b.substring(3)
+            b.startsWith("ws://", true) -> b = "https" + b.substring(2)
+            !b.startsWith("http", true) -> b = "https://$b"
+        }
         val m = java.util.regex.Pattern.compile("^(https?://[^/]+)").matcher(b)
-        return if (m.find()) m.group(1) else b
+        val host = if (m.find()) m.group(1) else b
+        // 业务空间域名可能带 /api/v1，路径一律丢掉，端点路径我们自己拼
+        return host.removeSuffix("/api/v1").trimEnd('/')
     }
 
     /**
@@ -1046,8 +1070,9 @@ object Voice {
      * 注意 qwen-audio 系列仅华北 2（北京）地域可用。
      */
     private fun ttsDashScope(ctx: Context, text: String, onUrl: (String) -> Unit) {
-        val url = originOf(AiPrefs.ttsBase(ctx)) +
-            "/api/v1/services/audio/tts/SpeechSynthesizer"
+        val host = originOf(AiPrefs.ttsBase(ctx))
+        val url = host + "/api/v1/services/audio/tts/SpeechSynthesizer"
+        lastEndpoint = url
         val voice = AiPrefs.ttsVoice(ctx).substringAfter(':').trim().ifBlank { "Cherry" }
         val body = JSONObject().apply {
             put("model", AiPrefs.ttsModel(ctx))
@@ -1080,9 +1105,12 @@ object Voice {
             append("音色：").append(AiPrefs.ttsVoice(ctx)).append('\n')
             append("地址：").append(AiPrefs.ttsBase(ctx)).append('\n')
             append("文本长度：").append(text.length).append('\n')
-            if (prov == "dashscope") {
-                append("实际端点：").append(originOf(AiPrefs.ttsBase(ctx)))
-                    .append("/api/v1/services/audio/tts/SpeechSynthesizer")
+            append("实际端点：").append(lastEndpoint.ifBlank { "(未发出请求)" })
+            val rawBase = AiPrefs.ttsBase(ctx)
+            if (rawBase.startsWith("ws", true)) {
+                append("\n⚠️ 你填的是 WebSocket 地址（").append(rawBase)
+                    .append("）\n已自动转成 ").append(originOf(rawBase))
+                    .append("\n建议直接改成 https:// 开头的域名，别带 /api-ws 路径")
             }
         }
     }
@@ -1219,6 +1247,10 @@ object Voice {
 
     @Volatile
     var lastTtsError: String? = null
+
+    /** 上次实际请求的完整 URL */
+    @Volatile
+    var lastEndpoint: String = ""
 
     /** 上一次合成/识别的完整原始报文，排查用 */
     @Volatile
@@ -3963,14 +3995,14 @@ class AiSettingsActivity : Activity() {
             )
 
             edAsrBase = edit(AiPrefs.asrBase(this))
-            edAsrBase.hint = "识别 Base URL，例 https://api.siliconflow.cn/v1"
+            edAsrBase.hint = "识别地址，百炼填 https://cn-beijing.maas.qianwenaiapi.com（别带 wss 和路径）"
             edAsrKey = edit(AiPrefs.asrKey(this), password = true)
             edAsrKey.hint = "识别 API Key"
             edAsrModel = edit(AiPrefs.asrModel(this))
             edAsrModel.hint = "识别模型，默认 FunAudioLLM/SenseVoiceSmall"
 
             edTtsBase = edit(AiPrefs.ttsBase(this))
-            edTtsBase.hint = "朗读 Base URL，例 https://api.siliconflow.cn/v1"
+            edTtsBase.hint = "朗读地址，百炼填 https://cn-beijing.maas.qianwenaiapi.com（别带 wss 和路径）"
             edTtsKey = edit(AiPrefs.ttsKey(this), password = true)
             edTtsKey.hint = "朗读 API Key"
             edTtsModel = edit(AiPrefs.ttsModel(this))
@@ -3980,7 +4012,7 @@ class AiSettingsActivity : Activity() {
             // 模型和音色必须配套，给一行提醒，免得又是 400
             body.addView(
                 TextView(this).apply {
-                    text = "⚠️ 音色要和模型配套：Cherry 只能配 qwen3-tts-*；qwen-audio-* 系列要用 longanhuan_v3 这类音色，混着用会报 400。"
+                    text = "⚠️ 音色要和模型配套：qwen-audio-3.0-tts-* 用 longanfengyue / longanhuan_v3 这类；Cherry 只能配 qwen3-tts-*，混着用会报 400。地址别填 wss:// 开头的（那是 WebSocket），要填 https:// 域名。"
                     setTextColor(0xFF8A7A5A.toInt())
                     textSize = 10f
                     setPadding(dp(2f), dp(2f), dp(2f), dp(4f))
@@ -4009,19 +4041,19 @@ class AiSettingsActivity : Activity() {
                 voiceProv = "dashscope"
                 AiPrefs.setVoiceProvider(this@AiSettingsActivity, voiceProv)
                 paintProvButtons()
-                edAsrBase.setText("https://dashscope.aliyuncs.com/compatible-mode/v1")
-                // 必须用非流式版本；带 -streaming 的是 WebSocket 协议，走不了 HTTP
-                edAsrModel.setText("qwen-audio-asr-flash")
-                edTtsBase.setText("https://dashscope.aliyuncs.com")
-                // Cherry 是 qwen3-tts 的音色，配 qwen-audio-* 会被拒（400）
-                edTtsModel.setText("qwen3-tts-flash")
-                edTtsVoice.setText("Cherry")
+                edAsrBase.setText("https://cn-beijing.maas.qianwenaiapi.com")
+                // 官方 HTTP 端点，别填 wss:// 那个（那是 WebSocket，走 SDK 用的）
+                edAsrModel.setText("qwen-audio-3.0-asr-flash")
+                edTtsBase.setText("https://cn-beijing.maas.qianwenaiapi.com")
+                // qwen-audio 系列配 cosyvoice 音色；Cherry 是 qwen3-tts 的，混用会 400
+                edTtsModel.setText("qwen-audio-3.0-tts-flash")
+                edTtsVoice.setText("longanfengyue")
                 if (edAsrKey.text.isBlank() && AiPrefs.visionKey(this@AiSettingsActivity).isNotBlank()) {
                     edAsrKey.setText(AiPrefs.visionKey(this@AiSettingsActivity))
                     edTtsKey.setText(AiPrefs.visionKey(this@AiSettingsActivity))
                     Toast.makeText(
                         this@AiSettingsActivity,
-                        "已填：识别 qwen-audio-asr-flash / 朗读 qwen3-tts-flash+Cherry。Key 沿用了视觉那个，确认下是不是百炼的",
+                        "已填北京地域端点 + qwen-audio-3.0-asr-flash + longanfengyue。Key 沿用了视觉那个，确认下是不是百炼的",
                         Toast.LENGTH_LONG,
                     ).show()
                 } else {
@@ -4328,10 +4360,40 @@ class AiSettingsActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        refreshA11yState()
+    }
+
+    /**
+     * 无障碍有四种状态，之前只分了两种，
+     * 「设置里显示已开启、但实际动不了手机」这种最常见的情况完全看不出来。
+     */
+    private fun refreshA11yState() {
         val on = AgentService.isEnabled()
-        stateA11y.text = if (on) "✅ 无障碍已开启，可以操作手机了" else "⚠️ 无障碍未开启，现在只能聊天"
-        stateA11y.setTextColor(if (on) Color.parseColor("#6BE3B0") else Color.parseColor("#FFC46B"))
-        btnA11y.text = if (on) "去系统里关闭无障碍" else "开启无障碍（不开启就只能聊天，不能操作手机）"
+        val inSettings = AgentService.enabledInSettings(this)
+        val stuck = inSettings && !on
+        val rootOk = AgentService.rootOk()
+
+        stateA11y.text = when {
+            on && rootOk -> "✅ 无障碍已开启，可以操作手机了"
+            on -> "⚠️ 服务连着但读不到界面，锁屏再亮一下试试"
+            stuck -> "⚠️ 开关是开的，但服务没起来 —— 去系统设置关掉再开一次"
+            else -> "⚠️ 无障碍未开启，现在只能聊天"
+        }
+        stateA11y.setTextColor(
+            Color.parseColor(if (on && rootOk) "#6BE3B0" else "#FFC46B"),
+        )
+        btnA11y.text = if (on && rootOk) {
+            "去系统里关闭无障碍"
+        } else {
+            "开启 / 重启无障碍（关掉再开一次）"
+        }
+        if (stuck) {
+            Toast.makeText(
+                this,
+                "装新版或授予新权限后 Android 常会这样，去系统设置关一下再开就好",
+                Toast.LENGTH_LONG,
+            ).show()
+        }
     }
 
     private fun save(silent: Boolean) {
