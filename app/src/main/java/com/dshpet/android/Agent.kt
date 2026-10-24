@@ -1024,7 +1024,11 @@ object Voice {
                     }))
                 }))
             }))
-            put("parameters", JSONObject().put("enable_itn", false))
+            put("parameters", JSONObject().apply {
+                put("enable_itn", false)
+                put("format", "mp4")
+                put("sample_rate", 16000)
+            })
         }
         val raw = try {
             DsNet.postRaw(url, AiPrefs.asrKey(ctx), body, 90_000)
@@ -2013,6 +2017,22 @@ object AgentTools {
     /**
      * 拼在人设后面的操控规则。写清楚边界能显著减少模型瞎点的概率。
      */
+    /**
+     * 无障碍没连上时，所有工具都会失败。
+     * 这时必须明确禁止模型编造「已经打开啦」之类的话 ——
+     * 用户会以为真打开了，其实什么都没发生，比直接报错更糟。
+     */
+    fun systemExtra(a11yOn: Boolean): String {
+        val guard = if (a11yOn) "" else """
+
+【重要·当前状态】你现在没有操作手机的能力（无障碍服务未连接）。
+任何 open_app / tap_text / tap_xy / swipe / input_text / screen_dump / look_screen 都会失败。
+严禁编造操作结果，严禁说「已经打开啦」「点了一下」「已经帮你弄好了」这类话。
+你应当如实告诉用户：无障碍没开，我现在动不了手机，并引导他去系统设置里开启。
+"""
+        return SYSTEM_EXTRA + guard
+    }
+
     val SYSTEM_EXTRA: String = """
 
 你还能操作这台安卓手机。可用工具：
@@ -2122,6 +2142,14 @@ object AgentRunner {
     @Volatile
     var shared = Session()
 
+    /** 主请求是否被降级成纯聊天（诊断用） */
+    @Volatile
+    var lastDegraded = false
+
+    /** 最近一次主请求的错误原因 */
+    @Volatile
+    var lastError: String = ""
+
     /** 单条对话的上下文（JSON 直传，方便把 tool_calls 原样回传） */
     class Session {
         val messages = JSONArray()
@@ -2164,7 +2192,10 @@ object AgentRunner {
      */
     fun run(ctx: Context, session: Session, userText: String, ui: UI): String {
         session.load(ctx)
-        session.system(AiPrefs.systemPrompt(ctx) + "\n" + AgentTools.SYSTEM_EXTRA)
+        session.system(
+            AiPrefs.systemPrompt(ctx) + "\n" +
+                AgentTools.systemExtra(AgentService.isEnabled()),
+        )
         session.messages.put(JSONObject().put("role", "user").put("content", userText))
 
         val model = AiPrefs.model(ctx)
@@ -2188,7 +2219,12 @@ object AgentRunner {
             } catch (t: Throwable) {
                 // 带 tools 的请求被拒（422/400）：多半是模型不吃这套工具格式。
                 // 降级成不带工具的纯聊天再问一次，至少别让用户看到崩溃。
+                AgentRunner.lastDegraded = true
+                AgentRunner.lastError = DsNet.friendly(t)
                 if (rounds == 1) {
+                    // 降级后必须告诉用户「我现在动不了手机」。
+                    // 之前静默降级，模型拿不到工具就自己编一段「已经打开啦」，
+                    // 看起来像在干活，其实什么都没做 —— 比报错更糟。
                     return try {
                         val plain = JSONObject().apply {
                             put("model", model)
@@ -2204,18 +2240,24 @@ object AgentRunner {
                         val o = DsNet.post(ctx, path, plain)
                         val t = o.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
                             ?.optString("content")?.trim().orEmpty()
-                        if (t.isEmpty()) "（模型没返回内容）" else t
+                        val body = if (t.isEmpty()) "（模型没返回内容）" else t
+                        return "⚠️ 工具调用失败，我现在动不了手机，下面只是普通聊天：\n\n" +
+                            DsNet.friendly(t) + "\n\n" + body
                     } catch (t2: Throwable) {
-                        "（没接上）" + DsNet.friendly(t2)
+                        return "⚠️ 接不上模型：" + DsNet.friendly(t2)
                     }
                 }
-                return "（没接上）" + DsNet.friendly(t)
+                return "⚠️ 工具调用失败：" + DsNet.friendly(t)
             }
 
             val msg = resp.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
                 ?: return "（模型返回了看不懂的内容）"
             val calls = msg.optJSONArray("tool_calls")
 
+            if (rounds == 1) {
+                AgentRunner.lastDegraded = false
+                AgentRunner.lastError = ""
+            }
             if (calls == null || calls.length() == 0) {
                 val answer = msg.optString("content").trim().ifBlank { "（模型没说话）" }
                 session.messages.put(cleanAssistantMsg(msg))
@@ -4552,6 +4594,14 @@ class AiSettingsActivity : Activity() {
         line("无障碍·服务已连接", AgentService.isEnabled())
         line("无障碍·能拿到窗口", AgentService.rootOk())
         b.append('\n')
+        line("主请求上次被降级", AgentRunner.lastDegraded)
+        if (AgentRunner.lastDegraded) {
+            b.append("↓ 这就是「她只会编造回复」的原因：主请求失败后退化成普通聊天，\n")
+            b.append("  模型拿不到工具，只能靠文字编。真实错误是：\n  ")
+            b.append(AgentRunner.lastError).append("\n")
+        }
+        b.append('\n')
+        b.append('\n')
         if (AgentService.enabledInSettings(this) && !AgentService.isEnabled()) {
             b.append("⚠️ 典型的「开关开着但服务没起来」。\n")
             b.append("去系统设置把「大肥鱼助手」关掉，再打开一次就好。\n")
@@ -4579,6 +4629,10 @@ class AiSettingsActivity : Activity() {
         line("识别引擎可用", Voice.available(this))
 
         b.append('\n')
+        if (!AgentService.isEnabled()) {
+            b.append("🔴 无障碍没连上 —— 打开应用 / 点击 / 截图 / 看图 全部依赖它，\n")
+            b.append("   所以现在这几样都不可用。去系统设置关掉再开一次。\n\n")
+        }
         line("视觉端点", AiPrefs.visionBase(this))
         line("视觉模型", AiPrefs.visionModel(this).ifBlank { "（自动探测）" })
         line("语音服务商", AiPrefs.voiceProvider(this))
