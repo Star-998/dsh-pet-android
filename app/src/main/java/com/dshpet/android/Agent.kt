@@ -1029,7 +1029,7 @@ object Voice {
         val raw = try {
             DsNet.postRaw(url, AiPrefs.asrKey(ctx), body, 90_000)
         } catch (t: Throwable) {
-            throw RuntimeException("识别请求失败：${'$'}{t.message ?: ""}")
+            throw RuntimeException("识别请求失败：" + (t.message ?: t.javaClass.simpleName))
         }
         rememberRaw(raw)
         // 返回形如 output.choices[0].message.content[0].text
@@ -2437,7 +2437,7 @@ object AgentRunner {
             }
         }
         return "看图失败，已试过 " + models.joinToString("、") +
-            "（端点 ${'$'}vBase）。\n" + errs.joinToString("\n") +
+            "（端点 $vBase）。\n" + errs.joinToString("\n") +
             "\n提示：如果每个都返回空，多半是这个账号/端点没开通图片能力。" +
             "可以在设置页「视觉（看图）」里单独填一家支持图片的模型。"
     }
