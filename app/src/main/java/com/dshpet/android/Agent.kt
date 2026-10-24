@@ -99,6 +99,7 @@ object AiPrefs {
     private const val K_TTS_KEY = "tts_key"
     private const val K_TTS_MODEL = "tts_model"
     private const val K_TTS_VOICE = "tts_voice"
+    private const val K_VPROVIDER = "voice_provider"
 
     const val DEFAULT_BASE = "https://api.deepseek.com"
     const val DEFAULT_PATH = "/v1/chat/completions"
@@ -131,6 +132,18 @@ object AiPrefs {
     fun setTtsOn(ctx: Context, v: Boolean) {
         sp(ctx).edit().putBoolean(K_TTS, v).apply()
     }
+
+    /**
+     * 语音服务商：
+     *  openai    —— 硅基流动 / OpenAI / Groq / 自建，走 /audio/transcriptions + /audio/speech
+     *  dashscope —— 阿里云百炼。它的兼容模式只有 /chat/completions 和 /embeddings，
+     *              音频必须走自有协议，所以单独一条通道。
+     */
+    fun voiceProvider(ctx: Context): String =
+        sp(ctx).getString(K_VPROVIDER, "").orEmpty().trim().lowercase().ifBlank { "openai" }
+
+    fun setVoiceProvider(ctx: Context, v: String) =
+        sp(ctx).edit().putString(K_VPROVIDER, v.trim().lowercase()).apply()
 
     // ---- 语音识别（ASR），走 OpenAI 兼容的 /audio/transcriptions
     fun asrBase(ctx: Context): String = sp(ctx).getString(K_ASR_BASE, "").orEmpty().trim()
@@ -311,6 +324,31 @@ object DsNet {
             val raw = readAll(if (code in 200..299) conn.inputStream else conn.errorStream)
             if (code !in 200..299) throw RuntimeException(explain(code, raw))
             return JSONObject(raw)
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** 最简 JSON POST：给百炼这类自定义端点用 */
+    fun postRaw(urlStr: String, key: String, body: JSONObject, timeoutMs: Int = 60_000): String {
+        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 15_000
+            readTimeout = timeoutMs
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", "Bearer $key")
+            setRequestProperty("Accept", "application/json")
+        }
+        try {
+            conn.outputStream.use {
+                it.write(body.toString().toByteArray(StandardCharsets.UTF_8))
+                it.flush()
+            }
+            val code = conn.responseCode
+            val raw = readAll(if (code in 200..299) conn.inputStream else conn.errorStream)
+            if (code !in 200..299) throw RuntimeException(explain(code, raw))
+            return raw
         } finally {
             conn.disconnect()
         }
@@ -544,6 +582,7 @@ object AiStore {
         put("tts_key", AiPrefs.ttsKey(ctx))
         put("tts_model", AiPrefs.ttsModel(ctx))
         put("tts_voice", AiPrefs.ttsVoice(ctx))
+        put("voice_provider", AiPrefs.voiceProvider(ctx))
     }
 
     /** 写一份到 App 私有目录，供自动恢复用 */
@@ -597,6 +636,7 @@ object AiStore {
         str("tts_key", { AiPrefs.setTtsKey(ctx, it) }, AiPrefs.ttsKey(ctx), "")
         str("tts_model", { AiPrefs.setTtsModel(ctx, it) }, AiPrefs.ttsModel(ctx), "FunAudioLLM/CosyVoice2-0.5B")
         str("tts_voice", { AiPrefs.setTtsVoice(ctx, it) }, AiPrefs.ttsVoice(ctx), "FunAudioLLM/CosyVoice2-0.5B:anna")
+        str("voice_provider", { AiPrefs.setVoiceProvider(ctx, it) }, AiPrefs.voiceProvider(ctx), "openai")
         // 旧版本备份会把主配置回退值写进 vision_*，这里识别出来当空处理并清掉
         val mainKey = o.optString("api_key", "").trim()
         val mainBase = o.optString("base_url", "").trim()
@@ -935,6 +975,7 @@ object Voice {
 
     /** multipart 上传到 /audio/transcriptions */
     fun transcribe(ctx: Context, file: java.io.File): String? {
+        if (AiPrefs.voiceProvider(ctx) == "dashscope") return asrDashScope(ctx, file)
         val base = AiPrefs.asrBase(ctx).trimEnd('/')
         val url = base + (if (base.endsWith("/v1")) "" else "/v1") + "/audio/transcriptions"
         val bytes = try {
@@ -958,6 +999,83 @@ object Voice {
         } catch (_: Throwable) {
             // response_format=text 的服务会直接返回纯文本
             raw.trim().ifBlank { null }
+        }
+    }
+
+    /**
+     * 百炼 ASR：兼容模式下没有 /audio/transcriptions，
+     * 要走 /chat/completions，把音频塞进 input_audio 的 data URI。
+     */
+    private fun asrDashScope(ctx: Context, file: java.io.File): String? {
+        val base0 = AiPrefs.asrBase(ctx).trimEnd('/')
+        val base = if (base0.endsWith("/v1")) base0 else base0 + "/v1"
+        val url = base + "/chat/completions"
+        val b64 = android.util.Base64.encodeToString(
+            file.readBytes(),
+            android.util.Base64.NO_WRAP,
+        )
+        val dataUri = "data:audio/mp4;base64,$b64"
+        val body = JSONObject().apply {
+            put("model", AiPrefs.asrModel(ctx))
+            put("stream", false)
+            put("messages", JSONArray().apply {
+                put(JSONObject().put("role", "user").put("content", JSONArray().apply {
+                    put(JSONObject().put("type", "input_audio").put("input_audio", JSONObject().apply {
+                        put("data", dataUri)
+                        put("format", "mp4")
+                    }))
+                }))
+            })
+            put("asr_options", JSONObject().put("enable_itn", false))
+        }
+        val raw = DsNet.postRaw(url, AiPrefs.asrKey(ctx), body, 90_000)
+        return DsNet.extractContent(
+            JSONObject(raw).optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message"),
+        ).trim().ifBlank { null }
+    }
+
+    /** 取 https://host，丢掉路径。百炼 TTS 的原生端点挂在根域名下 */
+    private fun originOf(base: String): String {
+        val b = base.trim().trimEnd('/')
+        val m = java.util.regex.Pattern.compile("^(https?://[^/]+)").matcher(b)
+        return if (m.find()) m.group(1) else b
+    }
+
+    /**
+     * 百炼 TTS：走原生 SpeechSynthesizer 端点，返回的是音频 URL，要再下载一次。
+     * 注意 qwen-audio 系列仅华北 2（北京）地域可用。
+     */
+    private fun ttsDashScope(ctx: Context, text: String, onUrl: (String) -> Unit) {
+        val url = originOf(AiPrefs.ttsBase(ctx)) +
+            "/api/v1/services/audio/tts/SpeechSynthesizer"
+        val voice = AiPrefs.ttsVoice(ctx).substringAfter(':').trim().ifBlank { "Cherry" }
+        val body = JSONObject().apply {
+            put("model", AiPrefs.ttsModel(ctx))
+            put("input", JSONObject().apply {
+                put("text", text)
+                put("voice", voice)
+                put("format", "mp3")
+            })
+        }
+        val raw = DsNet.postRaw(url, AiPrefs.ttsKey(ctx), body, 60_000)
+        val o = JSONObject(raw)
+        val u = o.optJSONObject("output")?.optJSONObject("audio")?.optString("url").orEmpty()
+        if (u.isBlank()) throw RuntimeException("百炼没返回音频地址：" + raw.take(160))
+        onUrl(u)
+    }
+
+    private fun downloadTo(urlStr: String, f: java.io.File) {
+        val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 60_000
+        }
+        try {
+            conn.inputStream.use { inp ->
+                f.outputStream().use { out -> inp.copyTo(out) }
+            }
+        } finally {
+            conn.disconnect()
         }
     }
 
@@ -1028,41 +1146,45 @@ object Voice {
         if (t.isBlank()) return true
         val speak = if (t.length > 300) t.take(300) else t
         return try {
-            val base = AiPrefs.ttsBase(ctx).trimEnd('/')
-            val url = base + (if (base.endsWith("/v1")) "" else "/v1") + "/audio/speech"
-            val body = JSONObject().apply {
-                put("model", AiPrefs.ttsModel(ctx))
-                put("input", speak)
-                put("voice", AiPrefs.ttsVoice(ctx))
-                put("response_format", "mp3")
-                put("speed", 1.05)
-            }
-            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 15_000
-                readTimeout = 60_000
-                setRequestProperty("Content-Type", "application/json")
-                setRequestProperty("Authorization", "Bearer " + AiPrefs.ttsKey(ctx))
-            }
-            val audio: ByteArray
-            try {
-                conn.outputStream.use {
-                    it.write(body.toString().toByteArray(StandardCharsets.UTF_8))
-                    it.flush()
-                }
-                val code = conn.responseCode
-                if (code !in 200..299) {
-                    throw RuntimeException(DsNet.explain(code, readAll(conn.errorStream)))
-                }
-                audio = conn.inputStream.readBytes()
-            } finally {
-                conn.disconnect()
-            }
-            if (audio.size < 256) return false
-
             val f = java.io.File(ctx.cacheDir, "dsh_tts.mp3")
-            f.writeBytes(audio)
+            if (AiPrefs.voiceProvider(ctx) == "dashscope") {
+                ttsDashScope(ctx, speak) { u -> downloadTo(u, f) }
+            } else {
+                val base = AiPrefs.ttsBase(ctx).trimEnd('/')
+                val url = base + (if (base.endsWith("/v1")) "" else "/v1") + "/audio/speech"
+                val body = JSONObject().apply {
+                    put("model", AiPrefs.ttsModel(ctx))
+                    put("input", speak)
+                    put("voice", AiPrefs.ttsVoice(ctx))
+                    put("response_format", "mp3")
+                    put("speed", 1.05)
+                }
+                val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doOutput = true
+                    connectTimeout = 15_000
+                    readTimeout = 60_000
+                    setRequestProperty("Content-Type", "application/json")
+                    setRequestProperty("Authorization", "Bearer " + AiPrefs.ttsKey(ctx))
+                }
+                val audio: ByteArray
+                try {
+                    conn.outputStream.use {
+                        it.write(body.toString().toByteArray(StandardCharsets.UTF_8))
+                        it.flush()
+                    }
+                    val code = conn.responseCode
+                    if (code !in 200..299) {
+                        throw RuntimeException(DsNet.explain(code, readAll(conn.errorStream)))
+                    }
+                    audio = conn.inputStream.readBytes()
+                } finally {
+                    conn.disconnect()
+                }
+                if (audio.size < 256) return false
+                f.writeBytes(audio)
+            }
+            if (f.length() < 256) return false
             play(ctx, f)
             true
         } catch (t: Throwable) {
@@ -3507,6 +3629,9 @@ class AiSettingsActivity : Activity() {
     private lateinit var edTtsKey: EditText
     private lateinit var edTtsModel: EditText
     private lateinit var edTtsVoice: EditText
+    private lateinit var btnVpOpenai: TextView
+    private lateinit var btnVpDash: TextView
+    private var voiceProv: String = "openai"
     private lateinit var result: TextView
     private lateinit var btnTest: TextView
     private lateinit var btnBalance: TextView
@@ -3719,6 +3844,54 @@ class AiSettingsActivity : Activity() {
                     setPadding(dp(2f), dp(14f), dp(2f), dp(2f))
                 },
             )
+
+            // 服务商切换：两家协议不同，必须分开走
+            voiceProv = AiPrefs.voiceProvider(this@AiSettingsActivity)
+            val provRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(2f), dp(4f), dp(2f), dp(4f))
+            }
+            fun provBtn(text: String, isDash: Boolean): TextView {
+                val tv = TextView(this).apply {
+                    this.text = text
+                    setTextColor(0xFFFFFFFF.toInt())
+                    textSize = 12f
+                    gravity = Gravity.CENTER
+                    setPadding(dp(10f), dp(9f), dp(10f), dp(9f))
+                    background = GradientDrawable().apply {
+                        cornerRadius = 10f * d
+                        setColor(if (voiceProv == if (isDash) "dashscope" else "openai") {
+                            0xFF4E6BFF.toInt()
+                        } else {
+                            0xFF232B38.toInt()
+                        })
+                        setStroke(dp(1f), 0xFF3A4560.toInt())
+                    }
+                    isClickable = true
+                }
+                tv.setOnClickListener {
+                    voiceProv = if (isDash) "dashscope" else "openai"
+                    AiPrefs.setVoiceProvider(this@AiSettingsActivity, voiceProv)
+                    paintProvButtons()
+                }
+                return tv
+            }
+            btnVpOpenai = provBtn("硅基流动 / OpenAI 兼容", false)
+            btnVpDash = provBtn("阿里云百炼", true)
+            provRow.addView(btnVpOpenai, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            provRow.addView(btnVpDash, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(6f), 0, 0, 0)
+            })
+            body.addView(provRow)
+
+            body.addView(
+                TextView(this).apply {
+                    text = "两家协议不一样：硅基流动等走标准 /audio/* 接口；百炼的兼容模式只有聊天接口，音频走自有协议（已单独适配）。"
+                    setTextColor(0xFF6B7A90.toInt())
+                    textSize = 10f
+                    setPadding(dp(2f), dp(0f), dp(2f), dp(4f))
+                },
+            )
             body.addView(
                 TextView(this).apply {
                     text = "两项都留空 = 用系统自带。填了之后：识别走云端（稳，不再报「客户端出错」），朗读用你选的音色。"
@@ -3762,7 +3935,32 @@ class AiSettingsActivity : Activity() {
                 isClickable = true
                 setOnClickListener { onClick() }
             }
+            rowVoice.addView(vBtn("填百炼模板") {
+                voiceProv = "dashscope"
+                AiPrefs.setVoiceProvider(this@AiSettingsActivity, voiceProv)
+                paintProvButtons()
+                edAsrBase.setText("https://dashscope.aliyuncs.com/compatible-mode/v1")
+                edAsrModel.setText("qwen-audio-asr-flash")
+                edTtsBase.setText("https://dashscope.aliyuncs.com")
+                edTtsModel.setText("qwen-audio-3.0-tts-plus")
+                edTtsVoice.setText("Cherry")
+                if (edAsrKey.text.isBlank() && AiPrefs.visionKey(this@AiSettingsActivity).isNotBlank()) {
+                    edAsrKey.setText(AiPrefs.visionKey(this@AiSettingsActivity))
+                    edTtsKey.setText(AiPrefs.visionKey(this@AiSettingsActivity))
+                    Toast.makeText(
+                        this@AiSettingsActivity,
+                        "模板已填，Key 沿用了视觉那个，确认下是不是百炼的 Key",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                } else {
+                    Toast.makeText(this@AiSettingsActivity, "模板已填，再补一下 Key", Toast.LENGTH_SHORT).show()
+                }
+                save(true)
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             rowVoice.addView(vBtn("填入硅基流动") {
+                voiceProv = "openai"
+                AiPrefs.setVoiceProvider(this@AiSettingsActivity, voiceProv)
+                paintProvButtons()
                 edAsrBase.setText("https://api.siliconflow.cn/v1")
                 edTtsBase.setText("https://api.siliconflow.cn/v1")
                 if (edAsrKey.text.isBlank() && AiPrefs.visionKey(this@AiSettingsActivity).isNotBlank()) {
@@ -4067,6 +4265,7 @@ class AiSettingsActivity : Activity() {
         AiPrefs.setTtsKey(this, edTtsKey.text.toString())
         AiPrefs.setTtsModel(this, edTtsModel.text.toString())
         AiPrefs.setTtsVoice(this, edTtsVoice.text.toString())
+        AiPrefs.setVoiceProvider(this, voiceProv)
         AiStore.saveToDisk(this)
         result.text = "当前：" + AiPrefs.all(this)
         if (!silent) Toast.makeText(this, "已保存到本机", Toast.LENGTH_SHORT).show()
@@ -4110,6 +4309,27 @@ class AiSettingsActivity : Activity() {
                 if (ok) "好了，去悬浮窗点 🎤 说话吧" else "没给权限，说话功能用不了",
                 Toast.LENGTH_SHORT,
             ).show()
+        }
+    }
+
+    /** 重画服务商按钮的选中态 */
+    private fun paintProvButtons() {
+        val dash = voiceProv == "dashscope"
+        btnVpOpenai.background = GradientDrawable().apply {
+            cornerRadius = 10f * resources.displayMetrics.density
+            setColor(if (!dash) 0xFF4E6BFF.toInt() else 0xFF232B38.toInt())
+            setStroke(
+                resources.displayMetrics.density.roundToInt(),
+                0xFF3A4560.toInt(),
+            )
+        }
+        btnVpDash.background = GradientDrawable().apply {
+            cornerRadius = 10f * resources.displayMetrics.density
+            setColor(if (dash) 0xFF4E6BFF.toInt() else 0xFF232B38.toInt())
+            setStroke(
+                resources.displayMetrics.density.roundToInt(),
+                0xFF3A4560.toInt(),
+            )
         }
     }
 
