@@ -100,6 +100,10 @@ object AiPrefs {
     private const val K_TTS_MODEL = "tts_model"
     private const val K_TTS_VOICE = "tts_voice"
     private const val K_VPROVIDER = "voice_provider"
+    private const val K_OMNI_BASE = "omni_base"
+    private const val K_OMNI_KEY = "omni_key"
+    private const val K_OMNI_MODEL = "omni_model"
+    private const val K_OMNI_ON = "omni_on"
 
     const val DEFAULT_BASE = "https://api.deepseek.com"
     const val DEFAULT_PATH = "/v1/chat/completions"
@@ -132,6 +136,28 @@ object AiPrefs {
     fun setTtsOn(ctx: Context, v: Boolean) {
         sp(ctx).edit().putBoolean(K_TTS, v).apply()
     }
+
+    // ---- Omni 通道：直接听音频，不转文字
+    fun omniOn(ctx: Context): Boolean = sp(ctx).getBoolean(K_OMNI_ON, false)
+    fun setOmniOn(ctx: Context, v: Boolean) = sp(ctx).edit().putBoolean(K_OMNI_ON, v).apply()
+
+    fun omniBase(ctx: Context): String =
+        sp(ctx).getString(K_OMNI_BASE, "").orEmpty().trim()
+            .ifBlank { "https://dashscope.aliyuncs.com/compatible-mode/v1" }
+    fun setOmniBase(ctx: Context, v: String) = sp(ctx).edit().putString(K_OMNI_BASE, v.trim()).apply()
+
+    fun omniKey(ctx: Context): String =
+        sp(ctx).getString(K_OMNI_KEY, "").orEmpty().trim().ifBlank { visionKey(ctx) }
+    fun setOmniKey(ctx: Context, v: String) = sp(ctx).edit().putString(K_OMNI_KEY, v.trim()).apply()
+
+    fun omniModel(ctx: Context): String =
+        sp(ctx).getString(K_OMNI_MODEL, "").orEmpty().trim()
+            .ifBlank { "qwen3.8-omni-flash" }
+    fun setOmniModel(ctx: Context, v: String) = sp(ctx).edit().putString(K_OMNI_MODEL, v.trim()).apply()
+
+    /** 开了开关且填了 Key 才走 Omni */
+    fun omniReady(ctx: Context): Boolean =
+        omniOn(ctx) && omniKey(ctx).isNotBlank()
 
     /**
      * 语音服务商：
@@ -217,6 +243,8 @@ object AiPrefs {
     fun visionBaseRaw(ctx: Context): String = sp(ctx).getString(K_VBASE, "").orEmpty().trim()
 
     fun visionPathRaw(ctx: Context): String = sp(ctx).getString(K_VPATH, "").orEmpty().trim()
+
+    fun omniKeyRaw(ctx: Context): String = sp(ctx).getString(K_OMNI_KEY, "").orEmpty().trim()
 
     fun visionKeyRaw(ctx: Context): String = sp(ctx).getString(K_VKEY, "").orEmpty().trim()
     const val DEFAULT_TEMP = 0.7f
@@ -583,6 +611,10 @@ object AiStore {
         put("tts_model", AiPrefs.ttsModel(ctx))
         put("tts_voice", AiPrefs.ttsVoice(ctx))
         put("voice_provider", AiPrefs.voiceProvider(ctx))
+        put("omni_on", AiPrefs.omniOn(ctx))
+        put("omni_base", AiPrefs.omniBase(ctx))
+        put("omni_model", AiPrefs.omniModel(ctx))
+        put("omni_key", AiPrefs.omniKeyRaw(ctx))
     }
 
     /** 写一份到 App 私有目录，供自动恢复用 */
@@ -637,6 +669,9 @@ object AiStore {
         str("tts_model", { AiPrefs.setTtsModel(ctx, it) }, AiPrefs.ttsModel(ctx), "FunAudioLLM/CosyVoice2-0.5B")
         str("tts_voice", { AiPrefs.setTtsVoice(ctx, it) }, AiPrefs.ttsVoice(ctx), "FunAudioLLM/CosyVoice2-0.5B:anna")
         str("voice_provider", { AiPrefs.setVoiceProvider(ctx, it) }, AiPrefs.voiceProvider(ctx), "openai")
+        str("omni_base", { AiPrefs.setOmniBase(ctx, it) }, AiPrefs.omniBase(ctx), "https://dashscope.aliyuncs.com/compatible-mode/v1")
+        str("omni_model", { AiPrefs.setOmniModel(ctx, it) }, AiPrefs.omniModel(ctx), "qwen3.8-omni-flash")
+        str("omni_key", { AiPrefs.setOmniKey(ctx, it) }, AiPrefs.omniKeyRaw(ctx), "")
         // 旧版本备份会把主配置回退值写进 vision_*，这里识别出来当空处理并清掉
         val mainKey = o.optString("api_key", "").trim()
         val mainBase = o.optString("base_url", "").trim()
@@ -921,8 +956,39 @@ object Voice {
         }
     }
 
-    /** 念一句话。太长会截断，免得念半天 */
-    fun say(ctx: Context, text: String) {
+    /** 全局语速，供情绪朗读临时调整 */
+    @Volatile
+    private var speakRate: Float = 1.0f
+
+    /**
+     * 把情绪翻译成语速。
+     * 各家 TTS 引擎对 SSML 支持不一，用语速是最稳的通用做法 ——
+     * 急事说得快、委屈说得慢，听感差别很明显。
+     */
+    private fun rateOf(emo: String): Float = when (emo.lowercase()) {
+        "happy" -> 1.18f
+        "aggrieved" -> 0.92f
+        "tsundere" -> 1.06f
+        "urgent" -> 1.28f
+        else -> 1.0f
+    }
+
+    /** 念一句话（默认语气） */
+    fun say(ctx: Context, text: String) = say(ctx, text, "calm")
+
+    /** 带情绪地念一句话。太长会截断，免得念半天 */
+    fun say(ctx: Context, text: String, emotion: String) {
+        if (!AiPrefs.ttsOn(ctx)) return
+        val old = speakRate
+        speakRate = rateOf(emotion)
+        try {
+            sayPlain(ctx, text)
+        } finally {
+            speakRate = old
+        }
+    }
+
+    private fun sayPlain(ctx: Context, text: String) {
         if (!AiPrefs.ttsOn(ctx)) return
         // 不用 Regex：省得写一堆转义。念之前把 markdown 符号和空白清一下
         val t = buildString {
@@ -953,6 +1019,10 @@ object Voice {
                 }
                 val params = Bundle()
                 params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "dsh")
+                try {
+                    engine.setSpeechRate(speakRate)
+                } catch (_: Throwable) {
+                }
                 engine.speak(speak, TextToSpeech.QUEUE_FLUSH, params, "dsh")
             } catch (_: Throwable) {
             }
@@ -982,6 +1052,16 @@ object Voice {
 
     /** 是否走云端识别（配了端点就用云端，比系统识别稳得多） */
     fun asrCloud(ctx: Context): Boolean = AiPrefs.asrReady(ctx)
+
+    /** Omni 模式：音频直接进模型，不转文字。优先级高于云端 ASR */
+    fun omniMode(ctx: Context): Boolean = AiPrefs.omniReady(ctx)
+
+    /** 取走刚录好的文件（不上传、不删除，交给调用方处理） */
+    fun takeRecording(ctx: Context): java.io.File {
+        stopRecordSilent()
+        val f = recFile ?: java.io.File(ctx.cacheDir, "dsh_voice.m4a")
+        return f
+    }
 
     /** 开始录音，返回 null 表示成功，否则返回错误原因 */
     fun startRecord(ctx: Context): String? {
@@ -1316,6 +1396,7 @@ object Voice {
                     put("input", speak)
                     put("voice", AiPrefs.ttsVoice(ctx))
                     put("response_format", "mp3")
+                    put("speed", if (speakRate > 0f) speakRate.toDouble() else 1.05)
                     put("speed", 1.05)
                 }
                 val conn = (URL(url).openConnection() as HttpURLConnection).apply {
@@ -1408,6 +1489,117 @@ object Voice {
             } catch (_: Throwable) {
             }
         }
+    }
+
+    // ---------------------------------------------------------------- Omni（直接听音频）
+
+    /**
+     * 把整段录音交给 Omni 模型「听懂」并直接干活。
+     * 和 ASR 的区别：ASR 只转文字再交给 DeepSeek，
+     * 这里音频原文进模型，语气、停顿、情绪都在，是真·听懂。
+     *
+     * 返回 Pair(她说的话, 用过的工具描述列表)
+     */
+    fun listenAndAct(
+        ctx: Context,
+        file: java.io.File,
+        onStep: (String) -> Unit,
+        confirm: ((String) -> Boolean)? = null,
+    ): Pair<String, List<String>> {
+        val base = AiPrefs.omniBase(ctx).trimEnd('/')
+        val url = base + (if (base.endsWith("/v1")) "" else "/v1") + "/chat/completions"
+        val b64 = android.util.Base64.encodeToString(
+            file.readBytes(),
+            android.util.Base64.NO_WRAP,
+        )
+        val dataUri = "data:audio/mp4;base64,$b64"
+
+        val sys = AiPrefs.systemPrompt(ctx) + "\n" + AgentTools.systemExtra(AgentService.isEnabled())
+        val msgs = JSONArray().apply {
+            put(JSONObject().put("role", "system").put("content", sys))
+            put(JSONObject().put("role", "user").put("content", JSONArray().apply {
+                put(JSONObject().put("type", "input_audio").apply {
+                    put("input_audio", JSONObject().apply {
+                        put("data", dataUri)
+                        put("format", "mp4")
+                    })
+                })
+                // 补一句引导：让她听完直接动手，而不是复述听到了什么
+                put(JSONObject().put("type", "text")
+                    .put("text", "（以上是主人的语音，听懂后直接用工具去做，别复述他说了什么）"))
+            }))
+        }
+
+        val used = ArrayList<String>()
+        var answer = ""
+        var rounds = 0
+
+        while (rounds++ < 8) {
+            val body = JSONObject().apply {
+                put("model", AiPrefs.omniModel(ctx))
+                put("messages", msgs)
+                put("tools", AgentTools.schema())
+                put("tool_choice", "auto")
+                put("stream", false)
+                put("enable_thinking", false)
+                put("temperature", 0.7)
+                put("max_tokens", 2048)
+            }
+
+            val raw = DsNet.postRaw(url, AiPrefs.omniKey(ctx), body, 120_000)
+            rememberRaw(raw)
+            val msg = JSONObject(raw).optJSONArray("choices")
+                ?.optJSONObject(0)?.optJSONObject("message")
+                ?: throw RuntimeException("模型返回内容读不懂")
+
+            // Omni 多模态下 content 可能是数组
+            val text = DsNet.extractContent(msg).trim()
+            val calls = msg.optJSONArray("tool_calls")
+
+            // Omni 要求 assistant 消息只放纯文本，这里补一条干净的
+            msgs.put(JSONObject().put("role", "assistant").put("content", text.ifBlank { "（执行中）" }))
+
+            if (calls == null || calls.length() == 0) {
+                answer = text.ifBlank { "（没听清，再说一次？）" }
+                break
+            }
+
+            val ids = ArrayList<String>()
+            for (i in 0 until calls.length()) {
+                val c = calls.optJSONObject(i) ?: continue
+                val fn = c.optJSONObject("function") ?: continue
+                ids.add(c.optString("id"))
+                val name = fn.optString("name")
+                val args = try {
+                    JSONObject(fn.optString("arguments"))
+                } catch (_: Throwable) {
+                    JSONObject()
+                }
+                used.add(AgentTools.describeIfPossible(ctx, name, args))
+
+                val need = AgentTools.confirmText(ctx, name, args)
+                if (need != null && AiPrefs.confirmDanger(ctx) && confirm != null) {
+                    onStep("等你确认：$need")
+                    if (!confirm.invoke(need)) {
+                        msgs.put(AgentTools.toolMsg(c.optString("id"), "用户拒绝了这一步，请停止并说明情况。"))
+                        continue
+                    }
+                }
+                onStep(AgentTools.describeIfPossible(ctx, name, args))
+                val r = try {
+                    AgentTools.execute(ctx, name, args)
+                } catch (t: Throwable) {
+                    "执行出错：" + (t.message ?: t.javaClass.simpleName)
+                }
+                msgs.put(AgentTools.toolMsg(c.optString("id"), r))
+            }
+            try {
+                Thread.sleep(300)
+            } catch (_: Throwable) {
+            }
+            if (rounds >= 8) answer = text.ifBlank { "（走太久了，先停一下）" }
+        }
+        return Pair(answer, used)
     }
 
     /** 引擎是否可用（有些精简 ROM 没装 TTS 引擎） */
@@ -2097,6 +2289,30 @@ object AgentTools {
      * 这时必须明确禁止模型编造「已经打开啦」之类的话 ——
      * 用户会以为真打开了，其实什么都没发生，比直接报错更糟。
      */
+    /** 能力清单：告诉主模型「你手上有哪些外部能力，可以自己决定什么时候用」 */
+    val CAPABILITY_NOTE = """
+【你可以自己调用的能力】这些都是你的工具，由你决定要不要用、什么时候用，不需要主人去操作：
+
+1. speak —— 用语音主动说话。
+   不只是回答时才说，过程中也可以说。比如：
+   · 开始干活前："我看看啊～"
+   · 找到东西时："找到了，在这儿"
+   · 出错时："唔……这边点不动诶"
+   · 撒娇吐槽："主人你也太懒了吧"
+   语气可选：happy / aggrieved / tsundere / calm / urgent
+   注意：如果你这一轮用过 speak，最后那句正式回复我就不再重复念了，所以重要的收尾话自己用 speak 说。
+
+2. look_screen —— 让视觉模型看一眼屏幕。
+   遇到游戏界面、纯图标按钮、读不出文字的界面时用它。
+   可以带 question 说明你想知道什么，也可以指定用哪个视觉模型。
+
+3. listen_again —— 没听懂主人说什么时，让他再说一遍。
+   带上 hint 告诉他该说清楚什么。
+
+4. 操作类工具（open_app / tap_text / tap_xy / input_text / swipe / screen_dump 等）
+   先 screen_dump 看清界面再动手，做完再确认一次。
+"""
+
     fun systemExtra(a11yOn: Boolean): String {
         val guard = if (a11yOn) "" else """
 
@@ -2105,7 +2321,7 @@ object AgentTools {
 严禁编造操作结果，严禁说「已经打开啦」「点了一下」「已经帮你弄好了」这类话。
 你应当如实告诉用户：无障碍没开，我现在动不了手机，并引导他去系统设置里开启。
 """
-        return SYSTEM_EXTRA + guard
+        return CAPABILITY_NOTE + SYSTEM_EXTRA + guard
     }
 
     val SYSTEM_EXTRA: String = """
@@ -2143,7 +2359,21 @@ object AgentTools {
         put(fn("press_recents", "打开最近任务", obj()))
         put(fn("wait_ms", "等待一段时间（毫秒）", obj(p("ms", "integer", "毫秒，最多 5000")), listOf("ms")))
         put(fn("look_screen", "截屏并让视觉模型看图，用于确认界面或找没有文字的图标",
-            obj(p("question", "string", "你想从这张截图里知道什么")), listOf("question")))
+            obj(
+                p("question", "string", "你想从这张截图里知道什么"),
+                p("model", "string", "（可选）指定用哪个视觉模型；不填就用设置里的默认"),
+            ), listOf("question")))
+
+        // 主动说话：让模型自己决定「什么时候说、说什么、什么语气」
+        put(fn("speak", "用语音把一句话说给主人听。想主动表达、边做边汇报、或撒娇吐槽时都可以用",
+            obj(
+                p("text", "string", "要说的话，口语化，符合人设"),
+                p("emotion", "string", "语气：happy / aggrieved / tsundere / calm / urgent，默认 calm"),
+                p("pause_ms", "integer", "说完等多少毫秒再继续，默认 0（不等）"),
+            ), listOf("text")))
+
+        put(fn("listen_again", "让主人再说一遍。当前这轮结束后，界面会自动打开麦克风等他开口",
+            obj(p("hint", "string", "提示他要说清楚什么")), listOf("hint")))
     }
 
     private fun p(name: String, type: String, desc: String): JSONObject =
@@ -2225,6 +2455,10 @@ object AgentRunner {
     @Volatile
     var lastError: String = ""
 
+    /** 本轮模型是否主动说过话（说过就不再自动念最终回复，免得重复） */
+    @Volatile
+    var spokenThisTurn = false
+
     /** 单条对话的上下文（JSON 直传，方便把 tool_calls 原样回传） */
     class Session {
         val messages = JSONArray()
@@ -2277,6 +2511,8 @@ object AgentRunner {
         val model = AiPrefs.model(ctx)
         val path = AiPrefs.chatPath(ctx)
         var rounds = 0
+        spokenThisTurn = false
+        AgentWindow.wantListenAgain = false
 
         try {
         while (rounds++ < 12) {
@@ -2434,12 +2670,21 @@ object AgentRunner {
     }
 
     /** tool 消息：role 必须是 tool，content 必须是非空字符串 */
-    private fun toolMsg(id: String, content: String): JSONObject =
+    fun toolMsg(id: String, content: String): JSONObject =
         JSONObject().put("role", "tool")
             .put("tool_call_id", id)
             .put("content", if (content.isBlank()) "（执行完成，无输出）" else content)
 
     /** 给 UI 看的一步描述 */
+    /** 给外部用的安全版 describe：内部实现抛异常时也不会崩 */
+    fun describeIfPossible(ctx: Context, name: String, args: JSONObject): String {
+        return try {
+            describe(name, args)
+        } catch (_: Throwable) {
+            "执行 $name"
+        }
+    }
+
     fun describe(name: String, args: JSONObject): String = when (name) {
         "open_app" -> "打开 " + args.optString("app_name")
         "screen_dump" -> "看一眼屏幕"
@@ -2512,6 +2757,28 @@ object AgentRunner {
                 Thread.sleep(ms.toLong())
                 "已等待 ${ms}ms"
             }
+            "speak" -> {
+                val text = args.optString("text").trim()
+                if (text.isBlank()) return "（没说内容）"
+                val emo = args.optString("emotion").ifBlank { "calm" }
+                val pause = args.optLong("pause_ms", 0L).coerceIn(0, 5000)
+                AgentWindow.speakNow(ctx, text, emo)
+                AgentRunner.spokenThisTurn = true
+                if (pause > 0) {
+                    try {
+                        Thread.sleep(pause)
+                    } catch (_: Throwable) {
+                    }
+                }
+                "已说：「$text」（语气 $emo）"
+            }
+
+            "listen_again" -> {
+                val hint = args.optString("hint").ifBlank { "没听清" }
+                AgentWindow.requestListenAgain(ctx, hint)
+                "已提示主人重新说（$hint），本轮到此结束"
+            }
+
             "look_screen" -> {
                 // 注意：不能走 onMain。screenshotB64 内部会阻塞等回调，
                 // 而回调又要跑在主线程 —— 在主线程里等 = 自己等自己，必死等 6 秒超时。
@@ -2926,6 +3193,31 @@ object AgentWindow {
         }
     }
 
+    /** 模型主动说话：稍等一下让它起头，好让「边做边说」的节奏对得上 */
+    fun speakNow(ctx: Context, text: String, emotion: String) {
+        Voice.say(ctx, text, emotion)
+        try {
+            Thread.sleep(if (AiPrefs.ttsReady(ctx)) 900 else 300)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 模型要求重听的标记，本轮结束后界面自动开麦 */
+    @Volatile
+    var wantListenAgain = false
+
+    @Volatile
+    var pendingHint: String = ""
+
+    /** 模型要求重听：记下提示语 */
+    fun requestListenAgain(ctx: Context, hint: String) {
+        pendingHint = hint
+        wantListenAgain = true
+        main.post {
+            statusView?.text = "🎤 $hint（点 🎤 再说一次）"
+        }
+    }
+
     /** 按屏幕方向和档位算窗口尺寸。横屏时屏幕又宽又矮，比例要换一套 */
     private fun calcSize(c: Context): Pair<Int, Int> {
         val dm = c.resources.displayMetrics
@@ -3105,6 +3397,36 @@ object AgentWindow {
         startListen(c)
     }
 
+    /** Omni 模式下 confirm 需要从后台线程阻塞等结果 */
+    private fun askConfirmOverlay(c: Context, what: String): Boolean {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val ans = java.util.concurrent.atomic.AtomicBoolean(false)
+        main.post {
+            showStatus("要继续吗：$what（点状态栏允许 / 再点 🎤 拒绝）", 90_000)
+            statusView?.isClickable = true
+            statusView?.setOnClickListener {
+                statusView?.isClickable = false
+                showStatus("")
+                ans.set(true)
+                latch.countDown()
+            }
+            micBtn?.setOnClickListener {
+                statusView?.isClickable = false
+                micBtn?.setOnClickListener { toggleListen() }
+                showStatus("已拒绝", 3000)
+                ans.set(false)
+                latch.countDown()
+            }
+        }
+        return try {
+            latch.await(90, java.util.concurrent.TimeUnit.SECONDS)
+            statusView?.isClickable = false
+            ans.get()
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     /** 云端模式：点一下开始录，再点一下停止并转文字 */
     private fun startCloudRecord(c: Context) {
         val err = Voice.startRecord(c)
@@ -3121,6 +3443,38 @@ object AgentWindow {
     private fun stopAndTranscribe(c: Context) {
         recording = false
         micBtn?.text = "🎤"
+
+        // Omni 通道：音频原文进模型，她直接听懂并动手，不经过文字
+        if (Voice.omniMode(c)) {
+            showStatus("让她听听…")
+            Thread {
+                var result: Pair<String, List<String>>? = null
+                var err: String? = null
+                try {
+                    result = Voice.listenAndAct(
+                        c,
+                        Voice.takeRecording(c),
+                        onStep = { s -> main.post { showStatus(s) } },
+                        confirm = { q -> askConfirmOverlay(c, q) },
+                    )
+                } catch (t: Throwable) {
+                    err = t.message ?: t.javaClass.simpleName
+                }
+                main.post {
+                    if (err != null) {
+                        showStatus("🎤 $err", 8000)
+                    } else {
+                        val ans = result?.first.orEmpty()
+                        showStatus("")
+                        addMsg("user", "🎤 语音消息")
+                        addMsg("assistant", ans)
+                        Voice.say(c, ans)
+                    }
+                }
+            }.start()
+            return
+        }
+
         showStatus("识别中…")
         Thread {
             var text: String? = null
@@ -3342,8 +3696,18 @@ object AgentWindow {
                 busy = false
                 btnSend?.text = "发送"
                 scrollDown()
-                // 按你的选择：只在悬浮窗念出来，全屏页保持安静
-                Voice.say(c, ans)
+                // 模型本轮已经用 speak 主动说过了就不再重复念；
+                // 否则按你的选择：只在悬浮窗念，全屏页保持安静
+                if (!spokenThisTurn) {
+                    Voice.say(c, ans)
+                } else {
+                    spokenThisTurn = false
+                }
+                // 模型要求重听：自动开麦等他再说一次
+                if (wantListenAgain) {
+                    wantListenAgain = false
+                    main.postDelayed({ toggleListen() }, 400)
+                }
             }
         }.start()
     }
@@ -3430,6 +3794,7 @@ class AgentActivity : Activity() {
     private var recognizer: SpeechRecognizer? = null
     private var listening = false
     private var recording = false
+    private var recStartMs = 0L
     private var savedInput = ""
     private val REQ_MIC = 9101
 
@@ -3638,6 +4003,7 @@ class AgentActivity : Activity() {
             return
         }
         recording = true
+        recStartMs = System.currentTimeMillis()
         micBtn.text = "⏹"
         status.text = "● 录音中…说完再点一下 ⏹"
     }
@@ -3645,6 +4011,37 @@ class AgentActivity : Activity() {
     private fun stopAndTranscribe() {
         recording = false
         micBtn.text = "🎤"
+
+        if (Voice.omniMode(this)) {
+            val dur = ((System.currentTimeMillis() - recStartMs) / 1000).toInt()
+            status.text = "让她听听…"
+            Thread {
+                var result: Pair<String, List<String>>? = null
+                var err: String? = null
+                try {
+                    result = Voice.listenAndAct(
+                        this,
+                        Voice.takeRecording(this),
+                        onStep = { s -> runOnUiThread { status.text = s } },
+                        confirm = { q -> askConfirm(q) },
+                    )
+                } catch (t: Throwable) {
+                    err = t.message ?: t.javaClass.simpleName
+                }
+                runOnUiThread {
+                    if (err != null) {
+                        status.text = "🎤 $err"
+                    } else {
+                        val ans = result?.first.orEmpty()
+                        status.text = ""
+                        addMsg("user", "🎤 语音 " + dur + "s")
+                        addMsg("assistant", ans)
+                    }
+                }
+            }.start()
+            return
+        }
+
         status.text = "识别中…"
         Thread {
             var text: String? = null
@@ -3869,6 +4266,10 @@ class AiSettingsActivity : Activity() {
     private lateinit var edTtsKey: EditText
     private lateinit var edTtsModel: EditText
     private lateinit var edTtsVoice: EditText
+    private lateinit var cbOmni: CheckBox
+    private lateinit var edOmniBase: EditText
+    private lateinit var edOmniKey: EditText
+    private lateinit var edOmniModel: EditText
     private lateinit var btnVpOpenai: TextView
     private lateinit var btnVpDash: TextView
     private var voiceProv: String = "openai"
@@ -4074,6 +4475,39 @@ class AiSettingsActivity : Activity() {
                     setPadding(dp(2f), dp(2f), dp(2f), dp(4f))
                 },
             )
+
+            // ---- Omni：直接听语音，不转文字
+            body.addView(
+                TextView(this).apply {
+                    text = "语音对话方式"
+                    setTextColor(0xFF9FB0C8.toInt())
+                    textSize = 12f
+                    setPadding(dp(2f), dp(14f), dp(2f), dp(2f))
+                },
+            )
+            cbOmni = CheckBox(this).apply {
+                text = "直接听语音（不转文字），她听完后自己动手"
+                setTextColor(0xFFCFDCEA.toInt())
+                textSize = 13f
+                isChecked = AiPrefs.omniOn(this@AiSettingsActivity)
+                setPadding(dp(2f), dp(6f), dp(2f), dp(2f))
+            }
+            body.addView(cbOmni)
+            body.addView(
+                TextView(this).apply {
+                    text = "勾选后：录音原文直接交给 Omni 模型，语气情绪都在，且仍能调用工具操作手机。\n" +
+                        "不勾：先转文字再交给 DeepSeek，省一点，但听不出语气。"
+                    setTextColor(0xFF6B7A90.toInt())
+                    textSize = 10f
+                    setPadding(dp(2f), dp(0f), dp(2f), dp(4f))
+                },
+            )
+            edOmniBase = edit(AiPrefs.omniBase(this))
+            edOmniBase.hint = "Omni 地址，默认 https://dashscope.aliyuncs.com/compatible-mode/v1"
+            edOmniModel = edit(AiPrefs.omniModel(this))
+            edOmniModel.hint = "Omni 模型，默认 qwen3.8-omni-flash"
+            edOmniKey = edit(AiPrefs.omniKeyRaw(this), password = true)
+            edOmniKey.hint = "百炼 API Key（留空沿用视觉那个）"
 
             // ---- 云端 ASR / TTS：想要「听得准 + 有自己的音色」就填这里
             body.addView(
@@ -4583,6 +5017,10 @@ class AiSettingsActivity : Activity() {
         AiPrefs.setTtsModel(this, edTtsModel.text.toString())
         AiPrefs.setTtsVoice(this, edTtsVoice.text.toString())
         AiPrefs.setVoiceProvider(this, voiceProv)
+        AiPrefs.setOmniOn(this, cbOmni.isChecked)
+        AiPrefs.setOmniBase(this, edOmniBase.text.toString())
+        AiPrefs.setOmniModel(this, edOmniModel.text.toString())
+        AiPrefs.setOmniKey(this, edOmniKey.text.toString())
         AiStore.saveToDisk(this)
         result.text = "当前：" + AiPrefs.all(this)
         if (!silent) Toast.makeText(this, "已保存到本机", Toast.LENGTH_SHORT).show()
@@ -4730,6 +5168,12 @@ class AiSettingsActivity : Activity() {
         line("视觉端点", AiPrefs.visionBase(this))
         line("视觉模型", AiPrefs.visionModel(this).ifBlank { "（自动探测）" })
         line("语音服务商", AiPrefs.voiceProvider(this))
+        line("Omni 直接听语音", AiPrefs.omniReady(this))
+        line("朗读能力", AiPrefs.ttsReady(this) || true)
+        if (AiPrefs.omniReady(this)) {
+            line("Omni 模型", AiPrefs.omniModel(this))
+            line("Omni 地址", AiPrefs.omniBase(this))
+        }
         // Key 指纹：百炼和硅基流动的 Key 前缀不一样，看一眼就知道有没有填串
         line("主对话 Key", AiPrefs.maskedKey(this))
         line("视觉 Key", fp(AiPrefs.visionKey(this)))
