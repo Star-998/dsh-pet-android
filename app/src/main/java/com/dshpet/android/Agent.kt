@@ -58,31 +58,6 @@ import org.json.JSONObject
 import kotlin.math.roundToInt
 
 /**
- * 下面三个是 AgentTools 的顶层包装。
- *
- * 为什么需要：Voice 和 AgentTools 是两个平级 object，
- * 在 Voice 里调 AgentTools 的成员必须写全 AgentTools.xxx，
- * 少写前缀就编译失败 —— 已经因为这个来回折腾好几轮了。
- * 改成顶层函数后，任何地方都能直接调用，不再依赖前缀。
- */
-private fun dshDescribeSafe(ctx: Context, name: String, args: JSONObject): String {
-    return try {
-        AgentTools.describe(name, args)
-    } catch (_: Throwable) {
-        "执行 $name"
-    }
-}
-
-private fun dshToolMsg(id: String, content: String): JSONObject =
-    AgentTools.toolMsg(id, content)
-
-private fun dshExecuteTool(ctx: Context, name: String, args: JSONObject): String =
-    AgentTools.execute(ctx, name, args)
-
-private fun dshConfirmText(ctx: Context, name: String, args: JSONObject): String? =
-    AgentTools.confirmText(ctx, name, args)
-
-/**
  * 本轮模型是否主动用 speak 说过话。
  * 放在文件顶层：悬浮窗、全屏页、工具执行处都要读写它，
  * 挂在任何 object 下都得写限定符，之前就因为这个编译失败过两次。
@@ -1534,108 +1509,6 @@ object Voice {
      *
      * 返回 Pair(她说的话, 用过的工具描述列表)
      */
-    fun listenAndAct(
-        ctx: Context,
-        file: java.io.File,
-        onStep: (String) -> Unit,
-        confirm: ((String) -> Boolean)? = null,
-    ): Pair<String, List<String>> {
-        val base = AiPrefs.omniBase(ctx).trimEnd('/')
-        val url = base + (if (base.endsWith("/v1")) "" else "/v1") + "/chat/completions"
-        val b64 = android.util.Base64.encodeToString(
-            file.readBytes(),
-            android.util.Base64.NO_WRAP,
-        )
-        val dataUri = "data:audio/mp4;base64,$b64"
-
-        val sys = AiPrefs.systemPrompt(ctx) + "\n" + AgentTools.systemExtra(AgentService.isEnabled())
-        val msgs = JSONArray().apply {
-            put(JSONObject().put("role", "system").put("content", sys))
-            put(JSONObject().put("role", "user").put("content", JSONArray().apply {
-                put(JSONObject().put("type", "input_audio").apply {
-                    put("input_audio", JSONObject().apply {
-                        put("data", dataUri)
-                        put("format", "mp4")
-                    })
-                })
-                // 补一句引导：让她听完直接动手，而不是复述听到了什么
-                put(JSONObject().put("type", "text")
-                    .put("text", "（以上是主人的语音，听懂后直接用工具去做，别复述他说了什么）"))
-            }))
-        }
-
-        val used = ArrayList<String>()
-        var answer = ""
-        var rounds = 0
-
-        while (rounds++ < 8) {
-            val body = JSONObject().apply {
-                put("model", AiPrefs.omniModel(ctx))
-                put("messages", msgs)
-                put("tools", AgentTools.schema())
-                put("tool_choice", "auto")
-                put("stream", false)
-                put("enable_thinking", false)
-                put("temperature", 0.7)
-                put("max_tokens", 2048)
-            }
-
-            val raw = DsNet.postRaw(url, AiPrefs.omniKey(ctx), body, 120_000)
-            rememberRaw(raw)
-            val msg = JSONObject(raw).optJSONArray("choices")
-                ?.optJSONObject(0)?.optJSONObject("message")
-                ?: throw RuntimeException("模型返回内容读不懂")
-
-            // Omni 多模态下 content 可能是数组
-            val text = DsNet.extractContent(msg).trim()
-            val calls = msg.optJSONArray("tool_calls")
-
-            // Omni 要求 assistant 消息只放纯文本，这里补一条干净的
-            msgs.put(JSONObject().put("role", "assistant").put("content", text.ifBlank { "（执行中）" }))
-
-            if (calls == null || calls.length() == 0) {
-                answer = text.ifBlank { "（没听清，再说一次？）" }
-                break
-            }
-
-            val ids = ArrayList<String>()
-            for (i in 0 until calls.length()) {
-                val c = calls.optJSONObject(i) ?: continue
-                val fn = c.optJSONObject("function") ?: continue
-                ids.add(c.optString("id"))
-                val name = fn.optString("name")
-                val args = try {
-                    JSONObject(fn.optString("arguments"))
-                } catch (_: Throwable) {
-                    JSONObject()
-                }
-                used.add(dshDescribeSafe(ctx, name, args))
-
-                val need = dshConfirmText(ctx, name, args)
-                if (need != null && AiPrefs.confirmDanger(ctx) && confirm != null) {
-                    onStep("等你确认：$need")
-                    if (!confirm.invoke(need)) {
-                        msgs.put(dshToolMsg(c.optString("id"), "用户拒绝了这一步，请停止并说明情况。"))
-                        continue
-                    }
-                }
-                onStep(dshDescribeSafe(ctx, name, args))
-                val r = try {
-                    dshExecuteTool(ctx, name, args)
-                } catch (t: Throwable) {
-                    "执行出错：" + (t.message ?: t.javaClass.simpleName)
-                }
-                msgs.put(dshToolMsg(c.optString("id"), r))
-            }
-            try {
-                Thread.sleep(300)
-            } catch (_: Throwable) {
-            }
-            if (rounds >= 8) answer = text.ifBlank { "（走太久了，先停一下）" }
-        }
-        return Pair(answer, used)
-    }
-
     /** 引擎是否可用（有些精简 ROM 没装 TTS 引擎） */
     fun available(ctx: Context): Boolean {
         return try {
@@ -2732,6 +2605,107 @@ object AgentRunner {
     }
 
     /** 真正干活。涉及无障碍的都切到主线程执行 */
+    fun listenAndAct(
+        ctx: Context,
+        file: java.io.File,
+        onStep: (String) -> Unit,
+        confirm: ((String) -> Boolean)? = null,
+    ): Pair<String, List<String>> {
+        val base = AiPrefs.omniBase(ctx).trimEnd('/')
+        val url = base + (if (base.endsWith("/v1")) "" else "/v1") + "/chat/completions"
+        val b64 = android.util.Base64.encodeToString(
+            file.readBytes(),
+            android.util.Base64.NO_WRAP,
+        )
+        val dataUri = "data:audio/mp4;base64,$b64"
+
+        val sys = AiPrefs.systemPrompt(ctx) + "\n" + AgentTools.systemExtra(AgentService.isEnabled())
+        val msgs = JSONArray().apply {
+            put(JSONObject().put("role", "system").put("content", sys))
+            put(JSONObject().put("role", "user").put("content", JSONArray().apply {
+                put(JSONObject().put("type", "input_audio").apply {
+                    put("input_audio", JSONObject().apply {
+                        put("data", dataUri)
+                        put("format", "mp4")
+                    })
+                })
+                // 补一句引导：让她听完直接动手，而不是复述听到了什么
+                put(JSONObject().put("type", "text")
+                    .put("text", "（以上是主人的语音，听懂后直接用工具去做，别复述他说了什么）"))
+            }))
+        }
+
+        val used = ArrayList<String>()
+        var answer = ""
+        var rounds = 0
+
+        while (rounds++ < 8) {
+            val body = JSONObject().apply {
+                put("model", AiPrefs.omniModel(ctx))
+                put("messages", msgs)
+                put("tools", AgentTools.schema())
+                put("tool_choice", "auto")
+                put("stream", false)
+                put("enable_thinking", false)
+                put("temperature", 0.7)
+                put("max_tokens", 2048)
+            }
+
+            val raw = DsNet.postRaw(url, AiPrefs.omniKey(ctx), body, 120_000)
+            val msg = JSONObject(raw).optJSONArray("choices")
+                ?.optJSONObject(0)?.optJSONObject("message")
+                ?: throw RuntimeException("模型返回内容读不懂")
+
+            // Omni 多模态下 content 可能是数组
+            val text = DsNet.extractContent(msg).trim()
+            val calls = msg.optJSONArray("tool_calls")
+
+            // Omni 要求 assistant 消息只放纯文本，这里补一条干净的
+            msgs.put(JSONObject().put("role", "assistant").put("content", text.ifBlank { "（执行中）" }))
+
+            if (calls == null || calls.length() == 0) {
+                answer = text.ifBlank { "（没听清，再说一次？）" }
+                break
+            }
+
+            val ids = ArrayList<String>()
+            for (i in 0 until calls.length()) {
+                val c = calls.optJSONObject(i) ?: continue
+                val fn = c.optJSONObject("function") ?: continue
+                ids.add(c.optString("id"))
+                val name = fn.optString("name")
+                val args = try {
+                    JSONObject(fn.optString("arguments"))
+                } catch (_: Throwable) {
+                    JSONObject()
+                }
+                used.add(describe(name, args))
+
+                val need = AgentTools.confirmText(ctx, name, args)
+                if (need != null && AiPrefs.confirmDanger(ctx) && confirm != null) {
+                    onStep("等你确认：$need")
+                    if (!confirm.invoke(need)) {
+                        msgs.put(toolMsg(c.optString("id"), "用户拒绝了这一步，请停止并说明情况。"))
+                        continue
+                    }
+                }
+                onStep(describe(name, args))
+                val r = try {
+                    execute(ctx, name, args)
+                } catch (t: Throwable) {
+                    "执行出错：" + (t.message ?: t.javaClass.simpleName)
+                }
+                msgs.put(toolMsg(c.optString("id"), r))
+            }
+            try {
+                Thread.sleep(300)
+            } catch (_: Throwable) {
+            }
+            if (rounds >= 8) answer = text.ifBlank { "（走太久了，先停一下）" }
+        }
+        return Pair(answer, used)
+    }
+
     fun execute(ctx: Context, name: String, args: JSONObject): String {
         val svc = AgentService.instance
             ?: return "无障碍服务没开，操作不了手机。让用户去设置里打开「大肥鱼桌宠」的无障碍开关。"
@@ -3482,7 +3456,7 @@ object AgentWindow {
                 var result: Pair<String, List<String>>? = null
                 var err: String? = null
                 try {
-                    result = Voice.listenAndAct(
+                    result = AgentRunner.listenAndAct(
                         c,
                         Voice.takeRecording(c),
                         onStep = { s -> main.post { showStatus(s) } },
@@ -4050,7 +4024,7 @@ class AgentActivity : Activity() {
                 var result: Pair<String, List<String>>? = null
                 var err: String? = null
                 try {
-                    result = Voice.listenAndAct(
+                    result = AgentRunner.listenAndAct(
                         this,
                         Voice.takeRecording(this),
                         onStep = { s -> runOnUiThread { status.text = s } },
