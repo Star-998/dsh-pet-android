@@ -65,6 +65,23 @@ import kotlin.math.roundToInt
 @Volatile
 private var gSpokenThisTurn = false
 
+/**
+ * 强制中断。长按桌宠时置位，执行循环每一步都会检查它。
+ * 放文件顶层：Agent（入口）、AgentRunner（执行循环）、AgentTools（工具）都要读写，
+ * 挂在任何一个 object 下都得写限定符 —— 之前因为这个编译失败过好几轮。
+ */
+@Volatile
+private var gAbortRequested = false
+
+/** 当前是否有任务在跑（决定长按是「中断」还是「打开对话」） */
+@Volatile
+private var gBusyRunning = false
+
+/** 中止当前任务 */
+private fun dshAbort() {
+    gAbortRequested = true
+}
+
 
 /**
  * 大肥鱼 · 手机 Agent
@@ -2216,8 +2233,21 @@ object AgentTools {
 3. listen_again —— 没听懂主人说什么时，让他再说一遍。
    带上 hint 告诉他该说清楚什么。
 
-4. 操作类工具（open_app / tap_text / tap_xy / input_text / swipe / screen_dump 等）
+4. 操作类工具（open_app / tap_text / tap_xy / input_text / swipe / drag / long_press / screen_dump 等）
    先 screen_dump 看清界面再动手，做完再确认一次。
+
+   · tap_text 点不到时，系统会自动截屏用视觉模型找坐标再点一次，
+     你不用手动重试；如果仍然失败，就换个说法或改用 tap_xy。
+   · 要拖动某个东西（挪图标、拉进度条、排序）用 drag，别用 swipe —— swipe 是快速甩动。
+   · 要呼出长按菜单用 long_press。
+
+【硬性红线·无需确认也会被拒绝】
+涉及密码输入框、支付/转账/充值金额、验证码、短信校验码的界面，
+input_text / tap_xy / tap_text / drag 会被直接拒绝，且不会给你"再确认一次"的机会。
+这不是你的选择，是代码层强制的。遇到这种情况，如实告诉主人需要他自己完成，不要试图绕过。
+
+【随时可能被叫停】
+主人长按桌宠可以强制中止你正在做的事。中止后你应当简短说明做到哪一步了，然后听他安排。
 """
 
     fun systemExtra(a11yOn: Boolean): String {
@@ -2320,6 +2350,64 @@ object AgentTools {
     )
 
     /** 返回 null 表示不用确认；否则返回要给用户看的确认文案 */
+    /**
+     * 硬拦截：这类操作直接拒绝执行，连确认框都不弹。
+     *
+     * 光靠提示词约束不可靠 —— 模型可能理解偏，也可能被用户的指令带着走。
+     * 所以在代码层做兜底：只要当前界面存在密码框 / 金额输入框 / 验证码，
+     * 涉及输入和点击的操作一律拒绝，且不给"再确认一次"的机会。
+     */
+    private val HARD_BLOCK_HINT = listOf(
+        "验证码", "校验码", "动态码", "短信码", "安全码",
+        "支付密码", "交易密码", "支付金额", "付款金额", "转账金额",
+        "充值金额", "请输入金额", "收款金额",
+    )
+
+    /** 扫描当前窗口，返回命中的敏感类型；没有返回 null */
+    private fun scanSensitive(): String? {
+        val svc = AgentService.instance ?: return null
+        val root = try {
+            svc.rootInActiveWindow
+        } catch (_: Throwable) {
+            null
+        } ?: return null
+
+        fun walk(n: android.view.accessibility.AccessibilityNodeInfo?): String? {
+            if (n == null) return null
+            // 密码框：系统直接标了 isPassword
+            if (n.isPassword) return "密码输入框"
+            val txt = (n.text?.toString().orEmpty()) + " " + (n.hintText?.toString().orEmpty()) +
+                " " + (n.contentDescription?.toString().orEmpty())
+            if (txt.isNotBlank()) {
+                val hit = HARD_BLOCK_HINT.firstOrNull { txt.contains(it) }
+                if (hit != null) return "「$hit」相关输入"
+            }
+            for (i in 0 until n.childCount) {
+                val r = walk(n.getChild(i))
+                if (r != null) return r
+            }
+            return null
+        }
+        return try {
+            walk(root)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /**
+     * 返回非空 = 硬拒绝，调用方必须直接放弃这一步。
+     * 只对会「写入」或「确认提交」的动作生效，单纯的滑动/返回不拦。
+     */
+    fun hardBlockReason(name: String): String? {
+        if (name != "input_text" && name != "tap_xy" && name != "tap_text" && name != "drag") {
+            return null
+        }
+        val why = scanSensitive() ?: return null
+        return "已拒绝：当前界面有${why}。" +
+            "涉及密码、金额、验证码的操作我不会做，这跟你怎么说没关系。请自己完成这一步。"
+    }
+
     fun confirmText(ctx: Context, name: String, args: JSONObject): String? {
         when (name) {
             "tap_text" -> {
@@ -2416,10 +2504,16 @@ object AgentRunner {
         val path = AiPrefs.chatPath(ctx)
         var rounds = 0
         gSpokenThisTurn = false
+        gBusyRunning = true
+        gAbortRequested = false
         AgentWindow.wantListenAgain = false
 
         try {
         while (rounds++ < 12) {
+            // 用户长按桌宠叫停
+            if (gAbortRequested) {
+                return "（好啦好啦，停手了～你说）"
+            }
             val body = JSONObject().apply {
                 put("model", model)
                 put("messages", AiStore.sanitize(session.messages))
@@ -2504,6 +2598,9 @@ object AgentRunner {
                     }
                 }
 
+                if (gAbortRequested) {
+                    return "（好啦好啦，停手了～你说）"
+                }
                 ui.step(describe(name, args))
                 val result = try {
                     execute(ctx, name, args)
@@ -2521,6 +2618,8 @@ object AgentRunner {
         }
         return "（走了太多次还没完成，先停一下。你可以再说具体一点。）"
         } finally {
+            gBusyRunning = false
+            gAbortRequested = false
             try {
                 session.persist(ctx)
             } catch (_: Throwable) {
@@ -2596,6 +2695,9 @@ object AgentRunner {
         "tap_xy" -> "点坐标 (" + args.optInt("x") + "," + args.optInt("y") + ")"
         "input_text" -> "输入「" + args.optString("text") + "」"
         "swipe" -> "向" + args.optString("direction") + "滑动"
+        "drag" -> "从 (" + args.optDouble("from_x").toInt() + "," + args.optDouble("from_y").toInt() +
+            ") 拖到 (" + args.optDouble("to_x").toInt() + "," + args.optDouble("to_y").toInt() + ")"
+        "long_press" -> "长按 (" + args.optDouble("x").toInt() + "," + args.optDouble("y").toInt() + ")"
         "press_back" -> "按返回"
         "press_home" -> "回桌面"
         "press_recents" -> "打开最近任务"
@@ -2706,9 +2808,73 @@ object AgentRunner {
         return Pair(answer, used)
     }
 
+    /** 判断工具返回是不是「没找到」 */
+    private fun looksNotFound(r: String): Boolean {
+        if (r.isBlank()) return true
+        return listOf("没找到", "找不到", "未找到", "没有找到", "不存在", "无匹配", "not found")
+            .any { r.contains(it, true) }
+    }
+
+    /** 从视觉模型的回答里抠出一对坐标。手写解析，不用 Regex 免得踩转义坑 */
+    private fun parseXY(text: String): Pair<Int, Int>? {
+        var nums = ""
+        val list = ArrayList<Int>()
+        for (ch in text) {
+            if (ch.isDigit()) {
+                nums += ch
+            } else {
+                if (nums.isNotEmpty()) {
+                    val v = nums.toIntOrNull()
+                    if (v != null) list.add(v)
+                    nums = ""
+                }
+            }
+        }
+        if (nums.isNotEmpty()) {
+            nums.toIntOrNull()?.let { list.add(it) }
+        }
+        // 取最后一对看起来像坐标的数（前面可能混着序号之类的）
+        for (i in list.size - 2 downTo 0) {
+            val a = list[i]
+            val b = list[i + 1]
+            if (a in 0..8000 && b in 0..8000) return Pair(a, b)
+        }
+        return null
+    }
+
+    /**
+     * tap_text 点不到时的兜底：截屏 → 视觉模型找坐标 → 按坐标点。
+     * 失败就如实返回，让模型知道这条路也走不通。
+     */
+    private fun retryByVision(ctx: Context, svc: AgentService, text: String): String {
+        return try {
+            val q = "屏幕上有「$text」这个按钮或条目吗？" +
+                "如果有，只回答它中心的坐标，格式就是一个 x 一个 y 两个整数，中间用英文逗号，例如 540,1200；" +
+                "如果确实没有，只回答 none"
+            val ans = lookScreen(ctx, svc, q)
+            val xy = parseXY(ans)
+                ?: return "用文字没点到，截屏看图也没定位到「$text」。（视觉回答：$ans）"
+            AgentWindow.setPassthrough(true)
+            Thread.sleep(250)
+            val r = onMain { svc.tapXY(xy.first, xy.second) }
+            Thread.sleep(150)
+            AgentWindow.setPassthrough(false)
+            "文字没点到，改用看图定位到 (" + xy.first + "," + xy.second + ") 再点了一次：$r"
+        } catch (toolErr: Throwable) {
+            "重试失败：" + (toolErr.message ?: toolErr.javaClass.simpleName)
+        }
+    }
+
     fun execute(ctx: Context, name: String, args: JSONObject): String {
         val svc = AgentService.instance
             ?: return "无障碍服务没开，操作不了手机。让用户去设置里打开「大肥鱼桌宠」的无障碍开关。"
+
+        // 强制中断优先于一切：用户长按桌宠就叫停
+        if (gAbortRequested) return "（主人叫停了，已中止）"
+
+        // 高风险硬拦截：密码 / 金额 / 验证码，直接拒绝且不提供确认
+        val blocked = AgentTools.hardBlockReason(name)
+        if (blocked != null) return blocked
 
         return when (name) {
             "open_app" -> {
@@ -2720,7 +2886,37 @@ object AgentRunner {
             "screen_dump" -> onMain { svc.screenDump() }
             "tap_text" -> {
                 val t = args.optString("text")
-                onMain { svc.tapByText(t) }
+                val r = onMain { svc.tapByText(t) }
+                // 点不到就自己兜底：截图让视觉模型找出坐标，再点一次。
+                // 游戏、自绘 UI 这类没有标准控件的界面全靠这条路径救回来。
+                if (looksNotFound(r)) retryByVision(ctx, svc, t) else r
+            }
+            "drag" -> {
+                // 长按拖拽：和普通滑动的区别就是按住的时间长得多，
+                // 这样系统才会把它识别成「拖」而不是「甩」
+                val fx = args.optDouble("from_x", -1.0).toFloat()
+                val fy = args.optDouble("from_y", -1.0).toFloat()
+                val tx = args.optDouble("to_x", -1.0).toFloat()
+                val ty = args.optDouble("to_y", -1.0).toFloat()
+                val ms = args.optLong("duration_ms", 1200L).coerceIn(400, 5000)
+                AgentWindow.setPassthrough(true)
+                Thread.sleep(250)
+                val rr = onMain { svc.swipe(fx, fy, tx, ty, ms) }
+                Thread.sleep(150)
+                AgentWindow.setPassthrough(false)
+                rr
+            }
+            "long_press" -> {
+                // 长按某点：起止坐标相同，靠时长触发系统的长按菜单
+                val x = args.optDouble("x", -1.0).toFloat()
+                val y = args.optDouble("y", -1.0).toFloat()
+                val ms = args.optLong("duration_ms", 1000L).coerceIn(500, 5000)
+                AgentWindow.setPassthrough(true)
+                Thread.sleep(250)
+                val rr = onMain { svc.swipe(x, y, x, y, ms) }
+                Thread.sleep(150)
+                AgentWindow.setPassthrough(false)
+                rr
             }
             "tap_xy" -> {
                 val x = args.optInt("x")
@@ -2899,9 +3095,24 @@ object Agent {
             }
             return
         }
+        // 正在执行任务时长按桌宠 = 强制叫停，然后才开对话框。
+        // 这样"她正在乱点"的时候能立刻拽住她。
+        if (gBusyRunning) {
+            dshAbort()
+            Toast.makeText(ctx, "已叫停，正在收手…", Toast.LENGTH_SHORT).show()
+        }
         if (opened) return
         AgentWindow.attach(ctx.applicationContext)
         opened = true
+    }
+
+    /** 供悬浮窗里的停止按钮复用 */
+    fun abortNow() = dshAbort()
+
+    fun isAborted() = gAbortRequested
+
+    fun resetAbort() {
+        gAbortRequested = false
     }
 
     fun markClosed() {
@@ -3150,6 +3361,28 @@ object AgentWindow {
             setOnClickListener { toggleListen() }
         }
         bottom.addView(inputView)
+        micBtn?.setOnTouchListener { _, ev ->
+            when (ev.action) {
+                android.view.MotionEvent.ACTION_DOWN -> {
+                    // 按住说话：配了云端语音就用，否则退回点两下的老方式
+                    if (Voice.omniMode(c) || Voice.asrCloud(c)) {
+                        pressTalkDown(c)
+                        true
+                    } else {
+                        false   // 交给 click 处理
+                    }
+                }
+                android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                    if (pressRecording) {
+                        pressTalkUp(c)
+                        true
+                    } else {
+                        false
+                    }
+                }
+                else -> false
+            }
+        }
         bottom.addView(micBtn)
         bottom.addView(btnSend)
         box.addView(bottom)
@@ -3430,6 +3663,88 @@ object AgentWindow {
         } catch (_: Throwable) {
             false
         }
+    }
+
+    /** 按住说话：按下开始录，松手就发 */
+    @Volatile
+    private var pressRecording = false
+
+    private fun pressTalkDown(c: Context) {
+        if (Build.VERSION.SDK_INT >= 23 &&
+            c.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            showStatus("🎤 没给录音权限，去设置页开启", 6000)
+            return
+        }
+        if (!Voice.omniMode(c) && !Voice.asrCloud(c)) {
+            showStatus("🎤 按住说话要先在设置页配好云端语音", 6000)
+            return
+        }
+        val err = Voice.startRecord(c)
+        if (err != null) {
+            showStatus("🎤 $err", 6000)
+            return
+        }
+        pressRecording = true
+        micBtn?.text = "🔴"
+        showStatus("● 松手就发")
+    }
+
+    private fun pressTalkUp(c: Context) {
+        if (!pressRecording) return
+        pressRecording = false
+        micBtn?.text = "🎤"
+
+        if (Voice.omniMode(c)) {
+            showStatus("让她听听…")
+            Thread {
+                var result: Pair<String, List<String>>? = null
+                var err: String? = null
+                try {
+                    result = AgentRunner.listenAndAct(
+                        c,
+                        Voice.takeRecording(c),
+                        onStep = { st -> main.post { showStatus(st) } },
+                        confirm = { q -> askConfirmOverlay(c, q) },
+                    )
+                } catch (toolErr: Throwable) {
+                    err = toolErr.message ?: toolErr.javaClass.simpleName
+                }
+                main.post {
+                    if (err != null) {
+                        showStatus("🎤 $err", 8000)
+                    } else {
+                        showStatus("")
+                        addMsg("user", "🎤 语音消息")
+                        addMsg("assistant", result?.first.orEmpty())
+                    }
+                }
+            }.start()
+            return
+        }
+
+        showStatus("识别中…")
+        Thread {
+            var text: String? = null
+            var err: String? = null
+            try {
+                text = Voice.transcribe(c, Voice.takeRecording(c))
+            } catch (toolErr: Throwable) {
+                err = toolErr.message ?: toolErr.javaClass.simpleName
+            }
+            main.post {
+                when {
+                    !text.isNullOrBlank() -> {
+                        showStatus("")
+                        inputView?.setText(if (savedInput.isBlank()) text else savedInput + text)
+                        submit()
+                    }
+                    err != null -> showStatus("🎤 $err", 8000)
+                    else -> showStatus("（没录到声音，按住久一点）", 5000)
+                }
+            }
+        }.start()
     }
 
     /** 云端模式：点一下开始录，再点一下停止并转文字 */
@@ -3909,7 +4224,29 @@ class AgentActivity : Activity() {
         }
         bottom.addView(input)
         bottom.addView(
-            micBtn,
+            micBtn.apply {
+                setOnTouchListener { _, ev ->
+                    when (ev.action) {
+                        android.view.MotionEvent.ACTION_DOWN -> {
+                            if (Voice.omniMode(this@AgentActivity) || Voice.asrCloud(this@AgentActivity)) {
+                                pressTalkDown()
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        android.view.MotionEvent.ACTION_UP, android.view.MotionEvent.ACTION_CANCEL -> {
+                            if (pressRecording) {
+                                pressTalkUp()
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        else -> false
+                    }
+                }
+            },
             LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -3997,6 +4334,88 @@ class AgentActivity : Activity() {
             micBtn.text = "🎤"
             status.text = "🎤 启动失败"
         }
+    }
+
+    /** 按住说话 */
+    @Volatile
+    private var pressRecording = false
+
+    private fun pressTalkDown() {
+        if (Build.VERSION.SDK_INT >= 23 &&
+            checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) !=
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) {
+            status.text = "🎤 没给录音权限"
+            return
+        }
+        if (!Voice.omniMode(this) && !Voice.asrCloud(this)) {
+            status.text = "🎤 按住说话要先在设置页配好云端语音"
+            return
+        }
+        val err = Voice.startRecord(this)
+        if (err != null) {
+            status.text = "🎤 $err"
+            return
+        }
+        pressRecording = true
+        micBtn.text = "🔴"
+        status.text = "● 松手就发"
+    }
+
+    private fun pressTalkUp() {
+        if (!pressRecording) return
+        pressRecording = false
+        micBtn.text = "🎤"
+
+        if (Voice.omniMode(this)) {
+            status.text = "让她听听…"
+            Thread {
+                var result: Pair<String, List<String>>? = null
+                var err: String? = null
+                try {
+                    result = AgentRunner.listenAndAct(
+                        this,
+                        Voice.takeRecording(this),
+                        onStep = { st -> runOnUiThread { status.text = st } },
+                        confirm = { q -> askConfirm(q) },
+                    )
+                } catch (toolErr: Throwable) {
+                    err = toolErr.message ?: toolErr.javaClass.simpleName
+                }
+                runOnUiThread {
+                    if (err != null) {
+                        status.text = "🎤 $err"
+                    } else {
+                        status.text = ""
+                        addMsg("user", "🎤 语音消息")
+                        addMsg("assistant", result?.first.orEmpty())
+                    }
+                }
+            }.start()
+            return
+        }
+
+        status.text = "识别中…"
+        Thread {
+            var text: String? = null
+            var err: String? = null
+            try {
+                text = Voice.transcribe(this, Voice.takeRecording(this))
+            } catch (toolErr: Throwable) {
+                err = toolErr.message ?: toolErr.javaClass.simpleName
+            }
+            runOnUiThread {
+                when {
+                    !text.isNullOrBlank() -> {
+                        status.text = ""
+                        input.setText(if (savedInput.isBlank()) text else savedInput + text)
+                        send()
+                    }
+                    err != null -> status.text = "🎤 $err"
+                    else -> status.text = "（没录到声音，按住久一点）"
+                }
+            }
+        }.start()
     }
 
     /** 云端模式：点一下开始录，再点一下停止并转文字 */
