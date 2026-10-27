@@ -58,6 +58,15 @@ import org.json.JSONObject
 import kotlin.math.roundToInt
 
 /**
+ * 本轮模型是否主动用 speak 说过话。
+ * 放在文件顶层：悬浮窗、全屏页、工具执行处都要读写它，
+ * 挂在任何 object 下都得写限定符，之前就因为这个编译失败过两次。
+ */
+@Volatile
+private var gSpokenThisTurn = false
+
+
+/**
  * 大肥鱼 · 手机 Agent
  *
  * 长按桌宠弹出悬浮对话框，说一句话，她就能：
@@ -2455,9 +2464,6 @@ object AgentRunner {
     @Volatile
     var lastError: String = ""
 
-    /** 本轮模型是否主动说过话（说过就不再自动念最终回复，免得重复） */
-    @Volatile
-    var spokenThisTurn = false
 
     /** 单条对话的上下文（JSON 直传，方便把 tool_calls 原样回传） */
     class Session {
@@ -2511,7 +2517,7 @@ object AgentRunner {
         val model = AiPrefs.model(ctx)
         val path = AiPrefs.chatPath(ctx)
         var rounds = 0
-        spokenThisTurn = false
+        gSpokenThisTurn = false
         AgentWindow.wantListenAgain = false
 
         try {
@@ -2763,7 +2769,7 @@ object AgentRunner {
                 val emo = args.optString("emotion").ifBlank { "calm" }
                 val pause = args.optLong("pause_ms", 0L).coerceIn(0, 5000)
                 AgentWindow.speakNow(ctx, text, emo)
-                AgentRunner.spokenThisTurn = true
+                gSpokenThisTurn = true
                 if (pause > 0) {
                     try {
                         Thread.sleep(pause)
@@ -3698,10 +3704,10 @@ object AgentWindow {
                 scrollDown()
                 // 模型本轮已经用 speak 主动说过了就不再重复念；
                 // 否则按你的选择：只在悬浮窗念，全屏页保持安静
-                if (!spokenThisTurn) {
+                if (!gSpokenThisTurn) {
                     Voice.say(c, ans)
                 } else {
-                    spokenThisTurn = false
+                    gSpokenThisTurn = false
                 }
                 // 模型要求重听：自动开麦等他再说一次
                 if (wantListenAgain) {
