@@ -641,6 +641,7 @@ object AiStore {
         put("omni_base", AiPrefs.omniBase(ctx))
         put("omni_model", AiPrefs.omniModel(ctx))
         put("omni_key", AiPrefs.omniKeyRaw(ctx))
+        put("memory", AiStore.loadMemory(ctx))
     }
 
     /** 写一份到 App 私有目录，供自动恢复用 */
@@ -698,6 +699,11 @@ object AiStore {
         str("omni_base", { AiPrefs.setOmniBase(ctx, it) }, AiPrefs.omniBase(ctx), "https://dashscope.aliyuncs.com/compatible-mode/v1")
         str("omni_model", { AiPrefs.setOmniModel(ctx, it) }, AiPrefs.omniModel(ctx), "qwen3.8-omni-flash")
         str("omni_key", { AiPrefs.setOmniKey(ctx, it) }, AiPrefs.omniKeyRaw(ctx), "")
+        try {
+            val mem = o.optJSONArray("memory")
+            if (mem != null) AiStore.saveMemory(ctx, mem)
+        } catch (_: Throwable) {
+        }
         // 旧版本备份会把主配置回退值写进 vision_*，这里识别出来当空处理并清掉
         val mainKey = o.optString("api_key", "").trim()
         val mainBase = o.optString("base_url", "").trim()
@@ -888,6 +894,121 @@ object AiStore {
         }
         flush()
         return out
+    }
+
+    // ---------------------------------------------------------- 跨对话记忆
+
+    private const val MEMORY_FILE = "dsh_memory.json"
+    private const val MEMORY_MAX = 40          // 最多记 40 条，多了会稀释重点
+    private const val MEMORY_TRIGGER = 12      // 对话累计到多少轮触发一次提炼
+
+    private fun memFile(ctx: Context): java.io.File =
+        java.io.File(ctx.filesDir, MEMORY_FILE)
+
+    /** 读出全部记忆 */
+    fun loadMemory(ctx: Context): JSONArray {
+        return try {
+            val f = memFile(ctx)
+            if (!f.exists()) return JSONArray()
+            JSONArray(f.readText(Charsets.UTF_8))
+        } catch (_: Throwable) {
+            JSONArray()
+        }
+    }
+
+    /** 覆盖写入 */
+    fun saveMemory(ctx: Context, arr: JSONArray) {
+        try {
+            val trim = JSONArray()
+            val from = (arr.length() - MEMORY_MAX).coerceAtLeast(0)
+            for (i in from until arr.length()) {
+                trim.put(arr.optJSONObject(i) ?: continue)
+            }
+            memFile(ctx).writeText(trim.toString(), Charsets.UTF_8)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 记一条。相同 key 覆盖，避免越记越乱 */
+    fun remember(ctx: Context, key: String, value: String) {
+        if (key.isBlank() || value.isBlank()) return
+        val arr = loadMemory(ctx)
+        for (i in arr.length() - 1 downTo 0) {
+            val o = arr.optJSONObject(i) ?: continue
+            if (o.optString("k") == key) arr.remove(i)
+        }
+        arr.put(JSONObject().put("k", key).put("v", value)
+            .put("t", System.currentTimeMillis()))
+        saveMemory(ctx, arr)
+    }
+
+    /** 按关键词删一条 */
+    fun forget(ctx: Context, keyword: String): Boolean {
+        val arr = loadMemory(ctx)
+        var hit = false
+        for (i in arr.length() - 1 downTo 0) {
+            val o = arr.optJSONObject(i) ?: continue
+            val line = o.optString("k") + " " + o.optString("v")
+            if (line.contains(keyword, true)) {
+                arr.remove(i)
+                hit = true
+            }
+        }
+        if (hit) saveMemory(ctx, arr)
+        return hit
+    }
+
+    fun clearMemory(ctx: Context) {
+        try {
+            memFile(ctx).delete()
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 拼成给模型看的一段话 */
+    fun memoryPrompt(ctx: Context): String {
+        val arr = loadMemory(ctx)
+        if (arr.length() == 0) return ""
+        val sb = StringBuilder()
+        sb.append("\n【关于主人的长期记忆】这些是之前的对话里记下的，一直有效：\n")
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            sb.append("· ").append(o.optString("k")).append("：").append(o.optString("v")).append('\n')
+        }
+        sb.append("如果发现哪条已经过时或记错了，用 update_memory 改掉；不合适的用 forget 删掉。")
+        return sb.toString()
+    }
+
+    /** 对话轮数计数，到阈值就让模型提炼一次 */
+    private const val TURNS_FILE = "dsh_turns.txt"
+
+    fun bumpTurn(ctx: Context): Int {
+        return try {
+            val f = java.io.File(ctx.filesDir, TURNS_FILE)
+            val n = (if (f.exists()) f.readText().trim().toIntOrNull() else 0) ?: 0
+            val v = n + 1
+            f.writeText(v.toString())
+            v
+        } catch (_: Throwable) {
+            0
+        }
+    }
+
+    fun shouldReflect(ctx: Context): Boolean {
+        val n = try {
+            val f = java.io.File(ctx.filesDir, TURNS_FILE)
+            if (f.exists()) f.readText().trim().toIntOrNull() ?: 0 else 0
+        } catch (_: Throwable) {
+            0
+        }
+        return n in 1..9999 && n % MEMORY_TRIGGER == 0
+    }
+
+    fun resetTurn(ctx: Context) {
+        try {
+            java.io.File(ctx.filesDir, TURNS_FILE).writeText("0")
+        } catch (_: Throwable) {
+        }
     }
 
     fun saveHistory(ctx: Context, messages: JSONArray) {
@@ -2230,10 +2351,19 @@ object AgentTools {
    遇到游戏界面、纯图标按钮、读不出文字的界面时用它。
    可以带 question 说明你想知道什么，也可以指定用哪个视觉模型。
 
-3. listen_again —— 没听懂主人说什么时，让他再说一遍。
+3. update_memory —— 记住关于主人的事，下次对话依然记得。
+   什么时候该主动记（不用等他说「记住」）：
+   · 他说了自己的偏好、习惯、称呼、口味、作息
+   · 他纠正了你的说法或做法
+   · 他提到常联系的人、常用的 App
+   · 他明确说「记住……」「以后都……」
+   key 用类别名（如 称呼 / 口味 / 常用App / 忌讳），value 一句话说清。
+   发现记错了或过时了，用同一个 key 覆盖；不该留的用 forget_memory 删。
+
+4. listen_again —— 没听懂主人说什么时，让他再说一遍。
    带上 hint 告诉他该说清楚什么。
 
-4. 操作类工具（open_app / tap_text / tap_xy / input_text / swipe / drag / long_press / screen_dump 等）
+5. 操作类工具（open_app / tap_text / tap_xy / input_text / swipe / drag / long_press / screen_dump 等）
    先 screen_dump 看清界面再动手，做完再确认一次。
 
    · tap_text 点不到时，系统会自动截屏用视觉模型找坐标再点一次，
@@ -2249,6 +2379,17 @@ input_text / tap_xy / tap_text / drag 会被直接拒绝，且不会给你"再�
 【随时可能被叫停】
 主人长按桌宠可以强制中止你正在做的事。中止后你应当简短说明做到哪一步了，然后听他安排。
 """
+
+    /**
+     * 完整系统提示 = 人设 + 能力清单 + 长期记忆 + 状态守卫。
+     * 统一在这里拼，避免 run 和 listenAndAct 各拼一份导致记忆漏注入。
+     */
+    fun buildSystem(ctx: Context): String {
+        return AiPrefs.systemPrompt(ctx) + "\n" +
+            CAPABILITY_NOTE +
+            AiStore.memoryPrompt(ctx) + "\n" +
+            systemExtra(AgentService.isEnabled())
+    }
 
     fun systemExtra(a11yOn: Boolean): String {
         val guard = if (a11yOn) "" else """
@@ -2311,6 +2452,18 @@ input_text / tap_xy / tap_text / drag 会被直接拒绝，且不会给你"再�
 
         put(fn("listen_again", "让主人再说一遍。当前这轮结束后，界面会自动打开麦克风等他开口",
             obj(p("hint", "string", "提示他要说清楚什么")), listOf("hint")))
+
+        // ---- 跨对话记忆：让她自己决定记什么
+        put(fn("update_memory", "把关于主人的信息记下来，以后每次对话都记得。",
+            obj(
+                p("key", "string", "记忆的类别名，例如 称呼、口味、常用App、作息、忌讳"),
+                p("value", "string", "具体内容，一句话说清"),
+            ), listOf("key", "value")))
+
+        put(fn("forget_memory", "删掉一条记错或已过时的记忆",
+            obj(p("keyword", "string", "要删的记忆里的关键词")), listOf("keyword")))
+
+        put(fn("list_memory", "看看目前都记了些什么", obj()))
     }
 
     private fun p(name: String, type: String, desc: String): JSONObject =
@@ -2494,10 +2647,7 @@ object AgentRunner {
      */
     fun run(ctx: Context, session: Session, userText: String, ui: UI): String {
         session.load(ctx)
-        session.system(
-            AiPrefs.systemPrompt(ctx) + "\n" +
-                AgentTools.systemExtra(AgentService.isEnabled()),
-        )
+        session.system(AgentTools.buildSystem(ctx))
         session.messages.put(JSONObject().put("role", "user").put("content", userText))
 
         val model = AiPrefs.model(ctx)
@@ -2575,7 +2725,8 @@ object AgentRunner {
             }
 
             session.messages.put(cleanAssistantMsg(msg))
-            AgentWindow.setCollapsed(true)
+            // 同步收起：异步版本会导致紧接着的截图把面板拍进去
+            AgentWindow.setCollapsedSync(true)
 
             for (i in 0 until calls.length()) {
                 val call = calls.optJSONObject(i) ?: continue
@@ -2695,6 +2846,9 @@ object AgentRunner {
         "tap_xy" -> "点坐标 (" + args.optInt("x") + "," + args.optInt("y") + ")"
         "input_text" -> "输入「" + args.optString("text") + "」"
         "swipe" -> "向" + args.optString("direction") + "滑动"
+        "update_memory" -> "记住：" + args.optString("key") + " = " + args.optString("value")
+        "forget_memory" -> "忘掉含「" + args.optString("keyword") + "」的记忆"
+        "list_memory" -> "看看都记住了什么"
         "drag" -> "从 (" + args.optDouble("from_x").toInt() + "," + args.optDouble("from_y").toInt() +
             ") 拖到 (" + args.optDouble("to_x").toInt() + "," + args.optDouble("to_y").toInt() + ")"
         "long_press" -> "长按 (" + args.optDouble("x").toInt() + "," + args.optDouble("y").toInt() + ")"
@@ -2721,7 +2875,7 @@ object AgentRunner {
         )
         val dataUri = "data:audio/mp4;base64,$b64"
 
-        val sys = AiPrefs.systemPrompt(ctx) + "\n" + AgentTools.systemExtra(AgentService.isEnabled())
+        val sys = AgentTools.buildSystem(ctx)
         val msgs = JSONArray().apply {
             put(JSONObject().put("role", "system").put("content", sys))
             put(JSONObject().put("role", "user").put("content", JSONArray().apply {
@@ -2872,6 +3026,12 @@ object AgentRunner {
         // 强制中断优先于一切：用户长按桌宠就叫停
         if (gAbortRequested) return "（主人叫停了，已中止）"
 
+        // 每次动手前都确认窗口是收起的。
+        // 单点异步调用可能被其它地方的 setCollapsed(false) 抢先，这里兜住。
+        if (name == "screen_dump" || name == "look_screen" || name == "open_app") {
+            AgentWindow.setCollapsedSync(true)
+        }
+
         // 高风险硬拦截：密码 / 金额 / 验证码，直接拒绝且不提供确认
         val blocked = AgentTools.hardBlockReason(name)
         if (blocked != null) return blocked
@@ -2958,6 +3118,31 @@ object AgentRunner {
                 Thread.sleep(ms.toLong())
                 "已等待 ${ms}ms"
             }
+            "update_memory" -> {
+                val k = args.optString("key").trim()
+                val v = args.optString("value").trim()
+                if (k.isBlank() || v.isBlank()) return "（没给内容，没记）"
+                AiStore.remember(ctx, k, v)
+                "记住了：$k = $v"
+            }
+
+            "forget_memory" -> {
+                val kw = args.optString("keyword").trim()
+                if (kw.isBlank()) return "（没给关键词）"
+                if (AiStore.forget(ctx, kw)) "已经忘掉含「$kw」的记忆了" else "没找到含「$kw」的记忆"
+            }
+
+            "list_memory" -> {
+                val arr = AiStore.loadMemory(ctx)
+                if (arr.length() == 0) return "（现在什么都还没记住）"
+                val sb = StringBuilder()
+                for (i in 0 until arr.length()) {
+                    val o = arr.optJSONObject(i) ?: continue
+                    sb.append("· ").append(o.optString("k")).append("：").append(o.optString("v")).append("\n")
+                }
+                sb.toString().trim()
+            }
+
             "speak" -> {
                 val text = args.optString("text").trim()
                 if (text.isBlank()) return "（没说内容）"
@@ -2992,10 +3177,13 @@ object AgentRunner {
 
     /** 截屏 → 视觉模型 → 文字 */
     private fun lookScreen(ctx: Context, svc: AgentService, question: String): String {
-        AgentWindow.setHidden(true)
-        Thread.sleep(300)
+        // 两步都得同步等：先收成状态条，再整个隐藏。
+        // 之前只用异步的 main.post，后台线程紧接着就截图，
+        // 窗口还没收下去就被拍进去了 —— 于是"截图里全是她自己的面板"。
+        AgentWindow.setCollapsedSync(true)
+        AgentWindow.setHiddenSync(true)
         val b64 = svc.screenshotB64()
-        AgentWindow.setHidden(false)
+        AgentWindow.setHiddenSync(false)
         if (b64.isBlank()) return "截屏失败：可能是系统版本低于 Android 11，或系统拒绝了这次截图。"
         val prompt =
             "这是一张安卓手机截图（宽 ${svc.screenW()} 高 ${svc.screenH()} 像素）。\n" +
@@ -3528,36 +3716,98 @@ object AgentWindow {
         }
     }
 
+    /**
+     * 收成一条状态条：执行动作时别占着半块屏幕。
+     *
+     * 同步版：main.post 是异步的，后台线程紧接着就截图的话，
+     * 窗口还没来得及收就拍进去了 —— 表现就是"截图里全是她自己的面板"。
+     * 所以这里丢到主线程后必须等它真的执行完再返回。
+     */
+    fun setCollapsedSync(on: Boolean) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyCollapsed(on)
+            return
+        }
+        val latch = java.util.concurrent.CountDownLatch(1)
+        main.post {
+            try {
+                applyCollapsed(on)
+            } finally {
+                latch.countDown()
+            }
+        }
+        try {
+            latch.await(1200, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+        }
+    }
+
     /** 收成一条状态条：执行动作时别占着半块屏幕 */
     fun setCollapsed(on: Boolean) {
         main.post {
-            val v = root ?: return@post
-            val c = ctx ?: return@post
-            val lp = v.layoutParams as? WindowManager.LayoutParams ?: return@post
-            val d = c.resources.displayMetrics.density
-            if (on) {
-                barView?.visibility = View.GONE
-                scrollView?.visibility = View.GONE
-                bottomView?.visibility = View.GONE
-                statusView?.visibility = View.VISIBLE
-                lp.height = (40 * d).roundToInt()
-            } else {
-                barView?.visibility = View.VISIBLE
-                scrollView?.visibility = View.VISIBLE
-                bottomView?.visibility = View.VISIBLE
-                statusView?.visibility = View.VISIBLE
-                lp.height = fullH
-            }
-            try { wm?.updateViewLayout(v, lp) } catch (_: Throwable) {}
+            applyCollapsed(on)
+        }
+    }
+
+    private fun applyCollapsed(on: Boolean) {
+        val v = root ?: return
+        val c = ctx ?: return
+        val lp = v.layoutParams as? WindowManager.LayoutParams ?: return
+        val d = c.resources.displayMetrics.density
+        if (on) {
+            barView?.visibility = View.GONE
+            scrollView?.visibility = View.GONE
+            bottomView?.visibility = View.GONE
+            statusView?.visibility = View.VISIBLE
+            lp.height = (40 * d).roundToInt()
+        } else {
+            barView?.visibility = View.VISIBLE
+            scrollView?.visibility = View.VISIBLE
+            bottomView?.visibility = View.VISIBLE
+            statusView?.visibility = View.VISIBLE
+            lp.height = fullH
+        }
+        try {
+            wm?.updateViewLayout(v, lp)
+        } catch (_: Throwable) {
         }
     }
 
     /** 截屏前把自己藏掉，免得拍进去的全是自己的面板 */
     fun setHidden(on: Boolean) {
         main.post {
-            val v = root ?: return@post
-            v.visibility = if (on) View.GONE else View.VISIBLE
+            applyHidden(on)
         }
+    }
+
+    /** 同步版：必须等窗口真的消失再返回，否则截图会拍到它 */
+    fun setHiddenSync(on: Boolean) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            applyHidden(on)
+            return
+        }
+        val latch = java.util.concurrent.CountDownLatch(1)
+        main.post {
+            try {
+                applyHidden(on)
+            } finally {
+                latch.countDown()
+            }
+        }
+        try {
+            latch.await(1200, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: Throwable) {
+        }
+        // 再多给一帧时间，让 SurfaceFlinger 真的把它从画面上摘掉
+        try {
+            Thread.sleep(180)
+        } catch (_: Throwable) {
+        }
+    }
+
+    private fun applyHidden(on: Boolean) {
+        val v = root
+        if (v != null) v.visibility = if (on) View.GONE else View.VISIBLE
     }
 
     /** 点麦克风开始/停止听写 */
@@ -5205,6 +5455,47 @@ class AiSettingsActivity : Activity() {
                 setMargins(dp(6f), 0, 0, 0)
             })
 
+            // ---- 长期记忆
+            body.addView(
+                TextView(this).apply {
+                    text = "长期记忆"
+                    setTextColor(0xFF9FB0C8.toInt())
+                    textSize = 12f
+                    setPadding(dp(2f), dp(14f), dp(2f), dp(2f))
+                },
+            )
+            val memRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+            memRow.addView(smallBtn("查看已记住的") {
+                val arr = AiStore.loadMemory(this)
+                val sb = StringBuilder()
+                if (arr.length() == 0) {
+                    sb.append("（还没记住任何东西）\n\n")
+                    sb.append("直接跟她说「记住我喜欢……」，\n她会自己存下来。")
+                } else {
+                    for (i in 0 until arr.length()) {
+                        val o2 = arr.optJSONObject(i) ?: continue
+                        sb.append("· ").append(o2.optString("k"))
+                            .append("：").append(o2.optString("v")).append('\n')
+                    }
+                }
+                showDetails("长期记忆（共 " + arr.length() + " 条）", sb.toString())
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            memRow.addView(smallBtn("清空记忆") {
+                AiStore.clearMemory(this)
+                Toast.makeText(this, "记忆已清空", Toast.LENGTH_SHORT).show()
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(6f), 0, 0, 0)
+            })
+            body.addView(memRow)
+            body.addView(
+                TextView(this).apply {
+                    text = "她会在对话里自己记下你的偏好；也可以直接说「记住……」让她存。"
+                    setTextColor(0xFF6B7A90.toInt())
+                    textSize = 10f
+                    setPadding(dp(2f), dp(2f), dp(2f), dp(4f))
+                },
+            )
+
             row.addView(smallBtn("修历史") {
                 // 磁盘上的旧历史可能已经坏了（孤儿 tool 消息），
                 // 会导致之后每一轮都 400。点这里清掉重来。
@@ -5593,7 +5884,7 @@ class AiSettingsActivity : Activity() {
         line("视觉模型", AiPrefs.visionModel(this).ifBlank { "（自动探测）" })
         line("语音服务商", AiPrefs.voiceProvider(this))
         line("Omni 直接听语音", AiPrefs.omniReady(this))
-        line("朗读能力", AiPrefs.ttsReady(this) || true)
+        line("长期记忆条数", AiStore.loadMemory(this).length())
         if (AiPrefs.omniReady(this)) {
             line("Omni 模型", AiPrefs.omniModel(this))
             line("Omni 地址", AiPrefs.omniBase(this))
