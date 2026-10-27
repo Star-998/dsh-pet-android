@@ -58,6 +58,31 @@ import org.json.JSONObject
 import kotlin.math.roundToInt
 
 /**
+ * 下面三个是 AgentTools 的顶层包装。
+ *
+ * 为什么需要：Voice 和 AgentTools 是两个平级 object，
+ * 在 Voice 里调 AgentTools 的成员必须写全 AgentTools.xxx，
+ * 少写前缀就编译失败 —— 已经因为这个来回折腾好几轮了。
+ * 改成顶层函数后，任何地方都能直接调用，不再依赖前缀。
+ */
+private fun dshDescribeSafe(ctx: Context, name: String, args: JSONObject): String {
+    return try {
+        AgentTools.describe(name, args)
+    } catch (_: Throwable) {
+        "执行 $name"
+    }
+}
+
+private fun dshToolMsg(id: String, content: String): JSONObject =
+    AgentTools.toolMsg(id, content)
+
+private fun dshExecuteTool(ctx: Context, name: String, args: JSONObject): String =
+    AgentTools.execute(ctx, name, args)
+
+private fun dshConfirmText(ctx: Context, name: String, args: JSONObject): String? =
+    AgentTools.confirmText(ctx, name, args)
+
+/**
  * 本轮模型是否主动用 speak 说过话。
  * 放在文件顶层：悬浮窗、全屏页、工具执行处都要读写它，
  * 挂在任何 object 下都得写限定符，之前就因为这个编译失败过两次。
@@ -1584,23 +1609,23 @@ object Voice {
                 } catch (_: Throwable) {
                     JSONObject()
                 }
-                used.add(AgentTools.describeIfPossible(ctx, name, args))
+                used.add(dshDescribeSafe(ctx, name, args))
 
-                val need = AgentTools.confirmText(ctx, name, args)
+                val need = dshConfirmText(ctx, name, args)
                 if (need != null && AiPrefs.confirmDanger(ctx) && confirm != null) {
                     onStep("等你确认：$need")
                     if (!confirm.invoke(need)) {
-                        msgs.put(AgentTools.toolMsg(c.optString("id"), "用户拒绝了这一步，请停止并说明情况。"))
+                        msgs.put(dshToolMsg(c.optString("id"), "用户拒绝了这一步，请停止并说明情况。"))
                         continue
                     }
                 }
-                onStep(AgentTools.describeIfPossible(ctx, name, args))
+                onStep(dshDescribeSafe(ctx, name, args))
                 val r = try {
-                    AgentTools.execute(ctx, name, args)
+                    dshExecuteTool(ctx, name, args)
                 } catch (t: Throwable) {
                     "执行出错：" + (t.message ?: t.javaClass.simpleName)
                 }
-                msgs.put(AgentTools.toolMsg(c.optString("id"), r))
+                msgs.put(dshToolMsg(c.optString("id"), r))
             }
             try {
                 Thread.sleep(300)
