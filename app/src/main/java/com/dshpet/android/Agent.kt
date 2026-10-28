@@ -1176,13 +1176,13 @@ object Voice {
         val old = speakRate
         speakRate = rateOf(emotion)
         try {
-            sayPlain(ctx, text)
+            sayPlain(ctx, text, emotion)
         } finally {
             speakRate = old
         }
     }
 
-    private fun sayPlain(ctx: Context, text: String) {
+    private fun sayPlain(ctx: Context, text: String, emotion: String = "calm") {
         if (!AiPrefs.ttsOn(ctx)) return
         // 不用 Regex：省得写一堆转义。念之前把 markdown 符号和空白清一下
         val t = buildString {
@@ -1716,6 +1716,11 @@ object Voice {
                 override fun onStart(utteranceId: String?) {}
                 override fun onDone(utteranceId: String?) {
                     if (utteranceId == id) { ok.set(true); latch.countDown() }
+                }
+                // 注意：抽象方法其实是单参的 onError(String)，双参那个是 API 33 才加的默认实现。
+                // 只写双参会报「没实现抽象成员」，两个都要写。
+                override fun onError(utteranceId: String?) {
+                    if (utteranceId == id) latch.countDown()
                 }
                 override fun onError(utteranceId: String?, errorCode: Int) {
                     if (utteranceId == id) latch.countDown()
@@ -5815,15 +5820,18 @@ class AiSettingsActivity : Activity() {
     private var btnSpMimo: TextView? = null
     private var btnSpYating: TextView? = null
     private fun paintSingProvButtons() {
+        // d / dp 是 buildUI 里的局部变量，这里拿不到，自己算一次密度
+        val density = resources.displayMetrics.density
+        fun px(v: Float) = (v * density).roundToInt()
         btnSpMimo?.background = GradientDrawable().apply {
-            cornerRadius = 10f * d
+            cornerRadius = 10f * density
             setColor(if (singProv == "mimo") 0xFF4E6BFF.toInt() else 0xFF232B38.toInt())
-            setStroke(dp(1f), 0xFF3A4560.toInt())
+            setStroke(px(1f), 0xFF3A4560.toInt())
         }
         btnSpYating?.background = GradientDrawable().apply {
-            cornerRadius = 10f * d
+            cornerRadius = 10f * density
             setColor(if (singProv == "yating") 0xFF4E6BFF.toInt() else 0xFF232B38.toInt())
-            setStroke(dp(1f), 0xFF3A4560.toInt())
+            setStroke(px(1f), 0xFF3A4560.toInt())
         }
     }
     private lateinit var cbOmni: CheckBox
@@ -6923,11 +6931,11 @@ class AiSettingsActivity : Activity() {
         line("Omni 直接听语音", AiPrefs.omniReady(this))
         line("长期记忆条数", AiStore.loadMemory(this).length())
         line("唱歌服务已配", AiPrefs.singReady(this))
-        sb.append("唱歌服务商：").append(AiPrefs.singProv(this)).append('\n')
-        sb.append("唱歌音色：").append(AiPrefs.singVoice(this)).append('\n')
+        b.append("唱歌服务商：").append(AiPrefs.singProv(this)).append('\n')
+        b.append("唱歌音色：").append(AiPrefs.singVoice(this)).append('\n')
         if (Singer.lastError != null) {
-            sb.append("上次唱歌失败：").append(Singer.lastError).append('\n')
-            sb.append("失败阶段：").append(Singer.lastStage).append('\n')
+            b.append("上次唱歌失败：").append(Singer.lastError).append('\n')
+            b.append("失败阶段：").append(Singer.lastStage).append('\n')
         }
         if (AiPrefs.omniReady(this)) {
             line("Omni 模型", AiPrefs.omniModel(this))
