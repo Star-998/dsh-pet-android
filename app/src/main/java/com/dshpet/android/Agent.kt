@@ -130,6 +130,10 @@ object AiPrefs {
     private const val K_OMNI_KEY = "omni_key"
     private const val K_OMNI_MODEL = "omni_model"
     private const val K_OMNI_ON = "omni_on"
+    private const val K_SING_KEY = "sing_key"
+    private const val K_SING_VOICE = "sing_voice"
+    private const val K_SING_BASE = "sing_base"
+    private const val K_SING_PROV = "sing_prov"
 
     const val DEFAULT_BASE = "https://api.deepseek.com"
     const val DEFAULT_PATH = "/v1/chat/completions"
@@ -155,6 +159,43 @@ object AiPrefs {
     fun setVisionModel(ctx: Context, v: String) {
         sp(ctx).edit().putString(K_VISION, v.trim()).apply()
     }
+
+    // ---- 唱歌（SVS）：雅婷智慧歌声生成
+    //
+    // 为什么选它：这是目前少数「能按指定音高唱」的公开 HTTP 接口。
+    // 火山 MemeSong 只能文本进、AI 自己编旋律，唱不出《虫儿飞》的原调；
+    // ACE Studio 的 API 官方明确说未公开发布；SoulX-Singer 开源但要自己部署服务器。
+    // 雅婷这条：POST 一份乐谱（每个字的音高 + 起止时间），异步返回音频。
+    fun singBase(ctx: Context): String =
+        sp(ctx).getString(K_SING_BASE, "").orEmpty().trim()
+            .ifBlank { "https://arts.api.yating.tw/v2" }
+    fun setSingBase(ctx: Context, v: String) = sp(ctx).edit().putString(K_SING_BASE, v.trim()).apply()
+
+    /**
+     * 唱歌服务商：
+     *  mimo   —— 小米 MiMo-V2-TTS。国内手机号可注册、限时免费，OpenAI 兼容端点。
+     *           用「唱歌」风格标签触发演唱模式。旋律由模型自己生成 —— 名曲大概率对得上，
+     *           但不保证是原调。
+     *  yating —— 雅婷智慧 SVS。能吃真正的乐谱（每个字的音高+时值），严格按谱唱，
+     *           是唯一能「指定旋律」的公开接口。但注册要台湾手机号，大陆号码收不到验证码。
+     */
+    fun singProv(ctx: Context): String =
+        sp(ctx).getString(K_SING_PROV, "").orEmpty().trim().lowercase().ifBlank { "mimo" }
+    fun setSingProv(ctx: Context, v: String) =
+        sp(ctx).edit().putString(K_SING_PROV, v.trim().lowercase()).apply()
+
+    fun singKey(ctx: Context): String = sp(ctx).getString(K_SING_KEY, "").orEmpty().trim()
+    fun setSingKey(ctx: Context, v: String) = sp(ctx).edit().putString(K_SING_KEY, v.trim()).apply()
+
+    fun singVoice(ctx: Context): String =
+        sp(ctx).getString(K_SING_VOICE, "").orEmpty().trim().ifBlank { "zh_tw_female_2" }
+    fun setSingVoice(ctx: Context, v: String) = sp(ctx).edit().putString(K_SING_VOICE, v.trim()).apply()
+
+    fun singReady(ctx: Context): Boolean = singKey(ctx).isNotBlank()
+
+    fun singKeyRaw(ctx: Context): String = sp(ctx).getString(K_SING_KEY, "").orEmpty().trim()
+    fun singVoiceRaw(ctx: Context): String = sp(ctx).getString(K_SING_VOICE, "").orEmpty().trim()
+    fun singBaseRaw(ctx: Context): String = sp(ctx).getString(K_SING_BASE, "").orEmpty().trim()
 
     /** 是否朗读她的回复（默认开） */
     fun ttsOn(ctx: Context): Boolean = sp(ctx).getBoolean(K_TTS, true)
@@ -641,6 +682,9 @@ object AiStore {
         put("omni_base", AiPrefs.omniBase(ctx))
         put("omni_model", AiPrefs.omniModel(ctx))
         put("omni_key", AiPrefs.omniKeyRaw(ctx))
+        put("sing_key", AiPrefs.singKeyRaw(ctx))
+        put("sing_voice", AiPrefs.singVoiceRaw(ctx))
+        put("sing_prov", AiPrefs.singProv(ctx))
         put("memory", AiStore.loadMemory(ctx))
     }
 
@@ -699,6 +743,9 @@ object AiStore {
         str("omni_base", { AiPrefs.setOmniBase(ctx, it) }, AiPrefs.omniBase(ctx), "https://dashscope.aliyuncs.com/compatible-mode/v1")
         str("omni_model", { AiPrefs.setOmniModel(ctx, it) }, AiPrefs.omniModel(ctx), "qwen3.8-omni-flash")
         str("omni_key", { AiPrefs.setOmniKey(ctx, it) }, AiPrefs.omniKeyRaw(ctx), "")
+        str("sing_key", { AiPrefs.setSingKey(ctx, it) }, AiPrefs.singKeyRaw(ctx), "")
+        str("sing_voice", { AiPrefs.setSingVoice(ctx, it) }, AiPrefs.singVoiceRaw(ctx), "")
+        str("sing_prov", { AiPrefs.setSingProv(ctx, it) }, AiPrefs.singProv(ctx), "mimo")
         try {
             val mem = o.optJSONArray("memory")
             if (mem != null) AiStore.saveMemory(ctx, mem)
@@ -1155,7 +1202,7 @@ object Voice {
         if (t.isBlank()) return
         val speak = if (t.length > 160) t.take(160) + "，后面的内容可以看屏幕" else t
         // 配了云端 TTS 就用云端（有自己的音色），否则退回系统 TTS
-        if (AiPrefs.ttsReady(ctx) && sayCloud(ctx, speak)) return
+        if (AiPrefs.ttsReady(ctx) && sayCloud(ctx, speak, emotion)) return
         Handler(Looper.getMainLooper()).post {
             try {
                 if (!ttsReady) init(ctx)
@@ -1526,11 +1573,42 @@ object Voice {
     private var player: MediaPlayer? = null
 
     /** 调云端 TTS 合成并播放；成功返回 true，失败返回 false（调用方再退回系统 TTS） */
-    fun sayCloud(ctx: Context, text: String): Boolean {
+    /**
+     * 情绪 → 语气指令。
+     *
+     * CosyVoice2 支持「指令化合成」：把语气要求直接写在文本前面，
+     * 模型就会按那个语气说。这是目前拿到"自己语气"最直接的办法。
+     * 只对 CosyVoice 系列加；其它模型会把这句当正文念出来，所以不能乱加。
+     */
+    private fun instructOf(emo: String): String = when (emo.lowercase()) {
+        "happy" -> "你能用高兴的语气说吗？"
+        "aggrieved" -> "你能用委屈的语气说吗？"
+        "tsundere" -> "你能用傲娇的语气说吗？"
+        "urgent" -> "你能用着急的语气说吗？"
+        "gentle" -> "你能用温柔的语气说吗？"
+        "sleepy" -> "你能用困困的语气说吗？"
+        else -> ""
+    }
+
+    /** 判断当前是不是 CosyVoice 系列（只有它认指令） */
+    private fun isCosy(ctx: Context): Boolean {
+        val m = AiPrefs.ttsModel(ctx).lowercase()
+        val v = AiPrefs.ttsVoice(ctx).lowercase()
+        return m.contains("cosyvoice") || v.contains("cosyvoice")
+    }
+
+    fun sayCloud(ctx: Context, text: String, emotion: String = "calm"): Boolean {
         if (!AiPrefs.ttsReady(ctx)) return false
         val t = text.trim()
         if (t.isBlank()) return true
-        val speak = if (t.length > 300) t.take(300) else t
+        // 先加语气指令，再截断长度 —— 否则可能把指令截没了
+        val withIns = if (isCosy(ctx)) {
+            val ins = instructOf(emotion)
+            if (ins.isBlank()) t else ins + t
+        } else {
+            t
+        }
+        val speak = if (withIns.length > 300) withIns.take(300) else withIns
         return try {
             val f = java.io.File(ctx.cacheDir, "dsh_tts.mp3")
             if (AiPrefs.voiceProvider(ctx) == "dashscope") {
@@ -1544,7 +1622,6 @@ object Voice {
                     put("voice", AiPrefs.ttsVoice(ctx))
                     put("response_format", "mp3")
                     put("speed", if (speakRate > 0f) speakRate.toDouble() else 1.05)
-                    put("speed", 1.05)
                 }
                 val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
@@ -1581,6 +1658,344 @@ object Voice {
         }
     }
 
+    // ---------------------------------------------------------- 唱歌
+
+    /**
+     * 为什么 TTS 平时唱不了歌：普通朗读没有「音高序列」。
+     * 唱歌的本质是每个字对应一个固定音高（F0），
+     * 而 TTS 只按语义自动生成起伏，你控制不了它落到哪个音上。
+     *
+     * 但 Android 的 TextToSpeech 有 setPitch（音高倍率）。
+     * 所以可以逐字合成：每个字先设好音高再合成，最后按顺序播出来。
+     * 音高用倍率 = 2^(半音/12)，这样音程是准的 ——
+     * 绝对调会跟着引擎基准走，但听起来就是那个旋律。
+     */
+    private val SCORE_BASE = intArrayOf(0, 2, 4, 5, 7, 9, 11)   // 简谱 1..7 相对 1 的半音
+
+    private fun splitTokens(src: String): List<String> {
+        val out = ArrayList<String>()
+        var cur = ""
+        for (ch in src) {
+            val isSep = ch == ' ' || ch == ',' || ch == '|' || ch == '\n' ||
+                ch == '\t' || ch == '，' || ch == '、' || ch == '；'
+            if (isSep) {
+                if (cur.isNotEmpty()) { out.add(cur); cur = "" }
+            } else {
+                cur += ch
+            }
+        }
+        if (cur.isNotEmpty()) out.add(cur)
+        return out
+    }
+
+    /** 音符 → 半音；null = 休止符（0） */
+    private fun tokenToSemi(tok: String): Int? {
+        var oct = 0
+        var digit = 0
+        for (ch in tok) {
+            when {
+                ch >= '1' && ch <= '7' -> digit = ch - '0'
+                ch == '+' || ch == '*' || ch == '\'' -> oct++
+                ch == '-' || ch == '_' -> oct--
+            }
+        }
+        if (digit == 0) return null
+        return SCORE_BASE[digit - 1] + oct * 12
+    }
+
+    private fun semiToPitch(semi: Int): Float {
+        val v = Math.pow(2.0, semi.toDouble() / 12.0).toFloat()
+        return v.coerceIn(0.5f, 2.0f)
+    }
+
+    private fun synthToFile(engine: android.speech.tts.TextToSpeech, text: String, f: java.io.File, id: String): Boolean {
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val ok = java.util.concurrent.atomic.AtomicBoolean(false)
+        try {
+            engine.setOnUtteranceProgressListener(object : android.speech.tts.UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) {
+                    if (utteranceId == id) { ok.set(true); latch.countDown() }
+                }
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    if (utteranceId == id) latch.countDown()
+                }
+            })
+        } catch (_: Throwable) {
+        }
+        val params = android.os.Bundle()
+        params.putString(android.speech.tts.TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, id)
+        return try {
+            if (f.exists()) f.delete()
+            val r = engine.synthesizeToFile(text, params, f, id)
+            if (r != android.speech.tts.TextToSpeech.SUCCESS) return false
+            latch.await(6, java.util.concurrent.TimeUnit.SECONDS)
+            ok.get() && f.length() > 256
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    /**
+     * 按简谱唱歌。lyrics 每个字对应 score 里的一个音符。
+     * 例：lyrics="两只老虎" score="1 2 3 1 1 2 3 1"
+     */
+    /**
+     * @param pinyin 可选。传了就用拼音合成，不用汉字。
+     *
+     * 为什么：TTS 念汉字会自带四声起伏（妈麻马骂），
+     * 这个起伏是"说话的调"，跟唱歌要求的"固定音高"是打架的 ——
+     * 叠上 setPitch 之后听起来会更怪。
+     * 而拼音（不带声调数字，如 yi 而不是 yī）TTS 会读得很平，
+     * 更接近唱歌里一个字一个固定音高的样子。这是本地演唱好听与否的关键。
+     */
+    fun singScore(ctx: Context, lyrics: String, score: String, pinyin: String = ""): String {
+        if (!AiPrefs.ttsOn(ctx)) return "朗读开关没开，唱不出来"
+        val pyList = if (pinyin.isBlank()) emptyList()
+        else pinyin.split("[\\s,，;；|]+".toRegex()).filter { it.isNotBlank() }
+        val chars = ArrayList<String>()
+        if (pyList.isNotEmpty()) {
+            for (x in pyList) chars.add(x)
+        } else {
+            for (ch in lyrics) {
+                if (!ch.isWhitespace()) chars.add(ch.toString())
+            }
+        }
+        val semis = ArrayList<Int?>()
+        for (t in splitTokens(score)) semis.add(tokenToSemi(t))
+        if (chars.isEmpty()) return "（没给歌词）"
+        if (pyList.isNotEmpty() && pyList.size != semis.size) {
+            return "拼音有 ${pyList.size} 个，音符有 ${semis.size} 个，对不齐"
+        }
+        if (semis.isEmpty()) return "（没给谱子。格式例如：1 2 3 1，高八度写 1+，低八度写 1-，0 是休止）"
+        if (semis.size < chars.size) {
+            return "音符有 ${semis.size} 个，歌词有 ${chars.size} 个字，对不齐"
+        }
+
+        // 整体移调：让旋律落在引擎支持的倍率区间里，否则高音低音会被压平
+        var lo = 0
+        var hi = 0
+        for (v in semis) {
+            if (v == null) continue
+            if (v < lo) lo = v
+            if (v > hi) hi = v
+        }
+        val mid = (lo + hi) / 2
+
+        if (!ttsReady) init(ctx)
+        val engine = tts ?: return "语音引擎没起来，唱不了"
+
+        stop()
+        val dir = java.io.File(ctx.cacheDir, "dsh_sing")
+        try {
+            if (!dir.exists()) dir.mkdirs()
+        } catch (_: Throwable) {
+        }
+        val files = ArrayList<java.io.File>()
+        try {
+            for (i in chars.indices) {
+                val semi = semis[i]
+                val f = java.io.File(dir, "n$i.wav")
+                val p = if (semi == null) 1.0f else semiToPitch(semi - mid)
+                try {
+                    engine.setPitch(p)
+                } catch (_: Throwable) {
+                }
+                if (synthToFile(engine, chars[i], f, "s$i")) {
+                    files.add(f)
+                }
+            }
+        } finally {
+            try {
+                engine.setPitch(1.0f)
+            } catch (_: Throwable) {
+            }
+        }
+        if (files.isEmpty()) return "一个字都没合成出来，可能是这个引擎不支持离线合成到文件"
+        val n = files.size
+        android.os.Handler(android.os.Looper.getMainLooper()).post { playSequence(files) }
+        return "唱完啦，一共 $n 个字（按简谱唱的，音程是准的，绝对调取决于引擎基准）"
+    }
+
+    // ------------------------------------------------------ 音频拼接
+    //
+    // 逐字合成后直接顺序播放会很难听：每个字自带起停，中间有咔哒声和空隙。
+    // 所以这里把每个字解码成 PCM，砍掉首尾静音，再做交叉淡化拼成一条连续音频。
+    // 这是本地演唱能不能听的关键 —— 不做这步，唱出来就是"一个字一个字往外蹦"。
+    private data class Pcm(val samples: ShortArray, val rate: Int)
+
+    /** 读 WAV（16bit PCM），顺带砍掉首尾静音 */
+    private fun readWavTrim(f: java.io.File): Pcm? {
+        return try {
+            val bytes = f.readBytes()
+            if (bytes.size < 44) return null
+            if (bytes[0] != 'R'.code.toByte() || bytes[1] != 'I'.code.toByte()) return null
+            var rate = 22050
+            var pos = 12
+            var dataOff = -1
+            var dataLen = -1
+            var bits = 16
+            while (pos + 8 <= bytes.size) {
+                val id = String(bytes, pos, 4, java.nio.charset.StandardCharsets.US_ASCII)
+                val size = ((bytes[pos + 4].toInt() and 0xFF)) or
+                    ((bytes[pos + 5].toInt() and 0xFF) shl 8) or
+                    ((bytes[pos + 6].toInt() and 0xFF) shl 16) or
+                    ((bytes[pos + 7].toInt() and 0xFF) shl 24)
+                val body = pos + 8
+                when (id) {
+                    "fmt " -> {
+                        if (body + 16 <= bytes.size) {
+                            rate = (bytes[body + 4].toInt() and 0xFF) or
+                                ((bytes[body + 5].toInt() and 0xFF) shl 8)
+                            bits = (bytes[body + 14].toInt() and 0xFF) or
+                                ((bytes[body + 15].toInt() and 0xFF) shl 8)
+                        }
+                    }
+                    "data" -> {
+                        dataOff = body
+                        dataLen = size
+                    }
+                }
+                pos = body + size + (size and 1)
+            }
+            if (dataOff < 0 || dataLen <= 0 || bits != 16) return null
+            val n = Math.min(dataLen, bytes.size - dataOff) / 2
+            if (n <= 0) return null
+            val sams = ShortArray(n)
+            for (i in 0 until n) {
+                val lo = bytes[dataOff + i * 2].toInt() and 0xFF
+                val hi = bytes[dataOff + i * 2 + 1].toInt()
+                sams[i] = ((hi shl 8) or lo).toShort()
+            }
+            // 找首尾有效区间：振幅超过峰值的 2% 才算有声音
+            var peak = 0
+            for (v in sams) {
+                val a = Math.abs(v.toInt())
+                if (a > peak) peak = a
+            }
+            val thr = Math.max(60, (peak * 0.02).toInt())
+            var head = 0
+            while (head < sams.size && Math.abs(sams[head].toInt()) < thr) head++
+            var tail = sams.size - 1
+            while (tail > head && Math.abs(sams[tail].toInt()) < thr) tail--
+            if (tail - head < 64) return null
+            Pcm(sams.copyOfRange(head, tail + 1), rate)
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    /** 交叉淡化拼接。fade 是交叠长度（采样点） */
+    private fun joinPcm(parts: List<Pcm>, fade: Int): Pcm? {
+        if (parts.isEmpty()) return null
+        var total = 0
+        for (p in parts) total += p.samples.size
+        total -= fade * (parts.size - 1)
+        if (total <= 0) return null
+        val out = ShortArray(total)
+        var w = 0
+        for (i in parts.indices) {
+            val cur = parts[i].samples
+            if (i == 0) {
+                System.arraycopy(cur, 0, out, w, cur.size)
+                w += cur.size
+            } else {
+                // 交叠区：上一个的尾巴渐弱 + 当前的开头渐强
+                val f = Math.min(fade, cur.size)
+                val base = w - f
+                for (k in 0 until f) {
+                    val a = out[base + k].toInt()
+                    val b = cur[k].toInt()
+                    val mix = a + ((b - a) * k / f)
+                    out[base + k] = mix.coerceIn(-32768, 32767).toShort()
+                }
+                System.arraycopy(cur, f, out, w, cur.size - f)
+                w += cur.size - f
+            }
+        }
+        return Pcm(out, parts[0].rate)
+    }
+
+    private fun writeWav(f: java.io.File, p: Pcm) {
+        val ch = 1
+        val bits = 16
+        val dataLen = p.samples.size * 2
+        val total = 44 + dataLen
+        val b = java.io.ByteArrayOutputStream(total)
+        fun le(v: Int, n: Int) {
+            for (k in 0 until n) b.write((v shr (8 * k)) and 0xFF)
+        }
+        b.write("RIFF".toByteArray(java.nio.charset.StandardCharsets.US_ASCII))
+        le(total - 8, 4)
+        b.write("WAVE".toByteArray(java.nio.charset.StandardCharsets.US_ASCII))
+        b.write("fmt ".toByteArray(java.nio.charset.StandardCharsets.US_ASCII))
+        le(16, 4)
+        le(1, 2)
+        le(ch, 2)
+        le(p.rate, 4)
+        le(p.rate * ch * bits / 8, 4)
+        le(ch * bits / 8, 2)
+        le(bits, 2)
+        b.write("data".toByteArray(java.nio.charset.StandardCharsets.US_ASCII))
+        le(dataLen, 4)
+        for (v in p.samples) {
+            b.write(v.toInt() and 0xFF)
+            b.write((v.toInt() shr 8) and 0xFF)
+        }
+        f.writeBytes(b.toByteArray())
+    }
+
+    private fun playSequence(files: List<java.io.File>) {
+        // 先拼成一条再播，避免逐字播放的咔哒声
+        val joined = try {
+            val parts = ArrayList<Pcm>()
+            for (f in files) readWavTrim(f)?.let { parts.add(it) }
+            if (parts.size >= 2) {
+                val rate = parts[0].rate
+                val fade = rate / 25   // 40ms 交叉淡化
+                val p = joinPcm(parts, fade)
+                if (p != null) {
+                    val out = java.io.File(files[0].parentFile, "joined.wav")
+                    writeWav(out, p)
+                    mutableListOf(out)
+                } else files
+            } else files
+        } catch (_: Throwable) {
+            files
+        }
+        playList(joined)
+    }
+
+    private fun playList(files: List<java.io.File>) {
+        var idx = 0
+        fun next() {
+            if (idx >= files.size) return
+            val f = files[idx]
+            idx++
+            try {
+                val mp = android.media.MediaPlayer()
+                mp.setDataSource(f.absolutePath)
+                mp.setOnCompletionListener {
+                    it.release()
+                    next()
+                }
+                mp.setOnErrorListener { mp2, _, _ ->
+                    try {
+                        mp2.release()
+                    } catch (_: Throwable) {
+                    }
+                    next()
+                    true
+                }
+                mp.prepare()
+                mp.start()
+            } catch (_: Throwable) {
+                next()
+            }
+        }
+        next()
+    }
+
     @Volatile
     var lastTtsError: String? = null
 
@@ -1595,6 +2010,12 @@ object Voice {
     /** 记录一次请求原文，方便把 400 的真实原因贴出来 */
     private fun rememberRaw(raw: String) {
         lastRaw = raw.take(1200)
+    }
+
+    /** 给外部（如唱歌模块）播放已合成好的音频文件 */
+    fun playFile(ctx: Context, f: java.io.File) {
+        if (!f.exists() || f.length() < 256) return
+        play(ctx, f)
     }
 
     private fun play(ctx: Context, f: java.io.File) {
@@ -2324,6 +2745,366 @@ object AppLauncher {
 
 // ==================================================================== 工具定义 + 执行
 
+/**
+ * 唱歌（SVS）—— 雅婷智慧「歌声生成」接口
+ *
+ * 关键点：唱歌和朗读的根本区别是有没有「音高序列」。
+ * TTS 只按语义自动生成起伏，控制不了每个字落在哪个音上，所以永远唱不到调。
+ * 而这里是把 DeepSeek 自己写出的乐谱（每个字的 MIDI 音高 + 时值）交给歌声合成模型，
+ * 模型严格按谱唱 —— 这才是"唱准"。
+ *
+ * 接口：POST {base}/vocal 提交乐谱 → 拿 uid → GET 轮询 → 下载音频
+ * 鉴权：Header key
+ */
+object Singer {
+
+    data class Note(val word: String, val pitch: Int, val beats: Double)
+
+    @Volatile
+    var lastError: String? = null
+
+    @Volatile
+    var lastStage: String = ""
+
+    /**
+     * 解析乐谱。格式：每条「字|音高|拍数」，条与条之间用空格、分号或换行分隔。
+     * 例：黑|67|1 黑|67|1 的|69|1 天|72|2
+     * 音高：MIDI 音高（60 = C4 = do）。
+     *       若填 1~7 则当简谱处理（1=do），高八度写 1+，低八度写 1-。
+     * 拍数：可省略，默认 1 拍；0.5 表示半拍。
+     */
+    fun parse(src: String): List<Note> {
+        val out = ArrayList<Note>()
+        var buf = ""
+        fun flush() {
+            val seg = buf.trim()
+            buf = ""
+            if (seg.isEmpty()) return
+            val parts = seg.split("|", "｜", "，").map { it.trim() }.filter { it.isNotEmpty() }
+            if (parts.size < 2) return
+            val w = parts[0]
+            val p = parsePitch(parts[1])
+            val b = if (parts.size >= 3) parts[2].toDoubleOrNull() ?: 1.0 else 1.0
+            if (p == null) return
+            out.add(Note(w, p, if (b <= 0) 1.0 else b))
+        }
+        for (ch in src) {
+            if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' || ch == ';' || ch == '；') {
+                flush()
+            } else {
+                buf += ch
+            }
+        }
+        flush()
+        return out
+    }
+
+    private fun parsePitch(raw: String): Int? {
+        val s0 = raw.trim()
+        if (s0.isEmpty()) return null
+        // 先看是不是简谱写法（1~7，可带 +/- 表示八度）
+        var oct = 0
+        var digit = 0
+        var pure = true
+        for (ch in s0) {
+            when {
+                ch >= '1' && ch <= '7' -> digit = ch - '0'
+                ch == '+' || ch == '*' -> oct++
+                ch == '-' || ch == '_' -> oct--
+                else -> pure = false
+            }
+        }
+        if (pure && digit >= 1) {
+            val semis = intArrayOf(0, 2, 4, 5, 7, 9, 11)
+            return 60 + semis[digit - 1] + oct * 12
+        }
+        return s0.toIntOrNull()
+    }
+
+    /**
+     * 小米 MiMo-V2-TTS 的唱歌模式。
+     *
+     * 它走的是 OpenAI 兼容的 /chat/completions，但有几个反常识的坑：
+     *  · 不能用 system 角色，会报错
+     *  · 待合成的文本必须放在 assistant 消息里，放 user 里不生效
+     *  · 风格标签要贴在文本最前面，唱歌是「(唱歌)」
+     *  · 鉴权用 api-key 头（也接受 Bearer）
+     * 返回的是 base64 音频，嵌在 choices[0].message.audio.data 里。
+     */
+    fun singMimo(ctx: Context, lyrics: String, style: String = ""): java.io.File? {
+        lastError = null
+        val key = AiPrefs.singKey(ctx)
+        if (key.isBlank()) {
+            lastError = "没填唱歌服务的 Key，去设置页「唱歌」区填上"
+            return null
+        }
+        val tag = if (style.isBlank()) "(唱歌)" else "(唱歌 $style)"
+        val msgs = org.json.JSONArray().apply {
+            put(org.json.JSONObject().put("role", "user")
+                .put("content", "请用自然的歌声演唱下面这段歌词。"))
+            put(org.json.JSONObject().put("role", "assistant")
+                .put("content", tag + lyrics))
+        }
+        val body = org.json.JSONObject()
+            .put("model", "mimo-v2-tts")
+            .put("messages", msgs)
+            .put("audio", org.json.JSONObject()
+                .put("format", "wav")
+                .put("voice", AiPrefs.singVoice(ctx).ifBlank { "mimo_default" }))
+
+        val b64: String = try {
+            lastStage = "提交歌词"
+            val conn = (java.net.URL("https://api.xiaomimimo.com/v1/chat/completions")
+                .openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "POST"
+                doOutput = true
+                connectTimeout = 20_000
+                readTimeout = 120_000
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("api-key", key)
+            }
+            try {
+                conn.outputStream.use {
+                    it.write(body.toString().toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                    it.flush()
+                }
+                val code = conn.responseCode
+                val raw = try {
+                    (if (code in 200..299) conn.inputStream else conn.errorStream)
+                        ?.bufferedReader()?.readText().orEmpty()
+                } catch (_: Throwable) {
+                    ""
+                }
+                if (code !in 200..299) {
+                    lastError = "HTTP $code " + raw.take(200)
+                    throw RuntimeException(DsNet.explain(code, raw))
+                }
+                lastStage = "取回音频"
+                val o = org.json.JSONObject(raw)
+                val msg = o.optJSONArray("choices")?.optJSONObject(0)?.optJSONObject("message")
+                msg?.optJSONObject("audio")?.optString("data")
+                    ?: msg?.optString("audio")
+                    ?: o.optJSONObject("audio")?.optString("data")
+                    ?: ""
+            } finally {
+                conn.disconnect()
+            }
+        } catch (t: Throwable) {
+            if (lastError == null) lastError = "提交失败：" + (t.message ?: t.javaClass.simpleName)
+            return null
+        }
+        if (b64.isBlank()) {
+            if (lastError == null) lastError = "服务端没返回音频数据"
+            return null
+        }
+        return try {
+            val bytes = android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
+            val f = java.io.File(ctx.cacheDir, "dsh_sing.wav")
+            f.writeBytes(bytes)
+            if (f.length() < 512) {
+                lastError = "返回的音频太小，可能是空的"
+                null
+            } else {
+                f
+            }
+        } catch (t: Throwable) {
+            lastError = "解码音频失败：" + (t.message ?: t.javaClass.simpleName)
+            null
+        }
+    }
+
+    /** 提交乐谱并等待出音频，返回本地文件；失败返回 null */
+    fun sing(ctx: Context, notes: List<Note>, tempo: Int, onStage: (String) -> Unit): java.io.File? {
+        lastError = null
+        if (notes.isEmpty()) {
+            lastError = "乐谱是空的"
+            return null
+        }
+        val key = AiPrefs.singKey(ctx)
+        if (key.isBlank()) {
+            lastError = "没填唱歌服务的 Key，去设置页「唱歌」区填上"
+            return null
+        }
+        val base = AiPrefs.singBase(ctx).trimEnd('/')
+        val beatMs = 60000.0 / tempo.coerceIn(40, 240)
+
+        // 逐字累加出起止时间（毫秒）
+        val arr = org.json.JSONArray()
+        var cursor = 0.0
+        for (n in notes) {
+            val dur = beatMs * n.beats
+            val o = org.json.JSONObject()
+            o.put("start", Math.round(cursor))
+            o.put("end", Math.round(cursor + dur))
+            o.put("word", n.word)
+            o.put("pitch", n.pitch)
+            arr.put(o)
+            cursor += dur
+        }
+
+        val meta = org.json.JSONObject().apply {
+            put("ticksPerBeat", 480)
+            put("tempoChanges", org.json.JSONArray().put(
+                org.json.JSONObject().put("time", 0).put("tempo", tempo)))
+            put("timeSignatureChanges", org.json.JSONArray().put(
+                org.json.JSONObject().put("time", 0).put("numerator", 4).put("denominator", 4)))
+            put("numberOfBars", Math.ceil(notes.sumOf { it.beats } / 4.0).toInt().coerceAtLeast(1))
+        }
+        val inst = org.json.JSONArray().put(
+            org.json.JSONObject()
+                .put("program", "vocal_leadsheet")
+                .put("notes", arr))
+        val body = org.json.JSONObject()
+            .put("voice", org.json.JSONObject().put("model", AiPrefs.singVoice(ctx)))
+            .put("metadata", meta)
+            .put("instruments", inst)
+
+        val uid: String = try {
+            lastStage = "提交乐谱"
+            onStage(lastStage)
+            postJson("$base/vocal", key, body)
+        } catch (t: Throwable) {
+            lastError = "提交失败：" + (t.message ?: t.javaClass.simpleName)
+            return null
+        }
+        if (uid.isBlank()) {
+            lastError = if (lastError != null) lastError else "提交后没拿到任务号"
+            return null
+        }
+
+        // 轮询。歌声合成比 TTS 慢得多，给足时间
+        lastStage = "合成中"
+        onStage(lastStage)
+        var url = ""
+        var tried = 0
+        while (tried < 60) {
+            Thread.sleep(3000)
+            tried++
+            val st = try {
+                getJson("$base/vocal/$uid", key)
+            } catch (t: Throwable) {
+                lastError = "查询状态失败：" + (t.message ?: t.javaClass.simpleName)
+                return null
+            }
+            val status = st.optString("status")
+            val path = st.optString("path")
+            if (status.equals("completed", true) && path.isNotBlank()) {
+                url = path
+                break
+            }
+            if (status.equals("error", true) || status.equals("failed", true)) {
+                lastError = "服务端合成失败：" + st.optString("message", status)
+                return null
+            }
+            if (tried % 5 == 0) onStage("合成中（已等 ${tried * 3} 秒）")
+        }
+        if (url.isBlank()) {
+            lastError = "等太久了，服务端还没出结果"
+            return null
+        }
+
+        lastStage = "下载音频"
+        onStage(lastStage)
+        val f = java.io.File(ctx.cacheDir, "dsh_sing.mp3")
+        return try {
+            val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = 20_000
+                readTimeout = 90_000
+            }
+            try {
+                if (conn.responseCode !in 200..299) throw RuntimeException("HTTP " + conn.responseCode)
+                conn.inputStream.use { inp -> f.outputStream().use { out -> inp.copyTo(out) } }
+            } finally {
+                conn.disconnect()
+            }
+            if (f.length() < 512) {
+                lastError = "下下来的音频太小，可能是空的"
+                null
+            } else {
+                f
+            }
+        } catch (t: Throwable) {
+            // 有些链接只给 http，升 https 失败就退回 http 再试
+            try {
+                val alt = if (url.startsWith("http://", true)) url
+                else "http" + url.substring(5)
+                val conn = (java.net.URL(alt).openConnection() as java.net.HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 20_000
+                    readTimeout = 90_000
+                }
+                try {
+                    conn.inputStream.use { inp -> f.outputStream().use { out -> inp.copyTo(out) } }
+                } finally {
+                    conn.disconnect()
+                }
+                if (f.length() >= 512) f else {
+                    lastError = "下载失败：" + (t.message ?: "")
+                    null
+                }
+            } catch (_: Throwable) {
+                lastError = "下载失败：" + (t.message ?: t.javaClass.simpleName)
+                null
+            }
+        }
+    }
+
+    private fun postJson(urlStr: String, key: String, body: org.json.JSONObject): String {
+        val conn = (java.net.URL(urlStr).openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            connectTimeout = 20_000
+            readTimeout = 60_000
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("key", key)
+        }
+        return try {
+            conn.outputStream.use {
+                it.write(body.toString().toByteArray(java.nio.charset.StandardCharsets.UTF_8))
+                it.flush()
+            }
+            val code = conn.responseCode
+            val raw = try {
+                (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.readText().orEmpty()
+            } catch (_: Throwable) {
+                ""
+            }
+            if (code !in 200..299) {
+                lastError = "HTTP $code " + raw.take(200)
+                throw RuntimeException(DsNet.explain(code, raw))
+            }
+            val o = org.json.JSONObject(raw)
+            o.optString("uid").ifBlank { o.optString("id") }
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    private fun getJson(urlStr: String, key: String): org.json.JSONObject {
+        val conn = (java.net.URL(urlStr).openConnection() as java.net.HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 20_000
+            readTimeout = 60_000
+            setRequestProperty("key", key)
+        }
+        return try {
+            val code = conn.responseCode
+            val raw = try {
+                (if (code in 200..299) conn.inputStream else conn.errorStream)
+                    ?.bufferedReader()?.readText().orEmpty()
+            } catch (_: Throwable) {
+                ""
+            }
+            if (code !in 200..299) throw RuntimeException("HTTP $code")
+            org.json.JSONObject(raw)
+        } finally {
+            conn.disconnect()
+        }
+    }
+}
+
 object AgentTools {
 
     /**
@@ -2338,13 +3119,29 @@ object AgentTools {
     val CAPABILITY_NOTE = """
 【你可以自己调用的能力】这些都是你的工具，由你决定要不要用、什么时候用，不需要主人去操作：
 
+0. sing_song —— 【唱歌】直接给歌词，她唱出来。
+   必填 title（歌名）和 lyrics（纯歌词，不要带歌名和括号标注）。
+   style 可选，描述唱法，如「童声」「温柔」「轻快」「深情」。
+   例：唱《虫儿飞》= lyrics 填「黑黑的天空低垂，亮亮的繁星相随…」
+   score（乐谱）和 tempo 只在配了「按谱演唱」服务时才用得上，平时不用填。
+
+0b. sing —— 【本地演唱，当前实际可用】用手机自带语音引擎按简谱唱，
+   音程是准的（能唱出原曲的调），但音色是朗读音，不如云端歌声合成像真人。
+   简谱写法：1-7 是音符，0 是休止，空格分隔；高八度加 +（5+），低八度加 -（5-）。
+   例：两只老虎 → 歌词"两只老虎两只老虎"，谱子"1 2 3 1 1 2 3 1"。
+   【关键】pinyin 参数强烈建议填：歌词的无声调拼音，个数要和音符一致。
+   汉字自带四声起伏，跟唱歌的固定音高打架，唱出来像念字；
+   用拼音合成会平很多，才像唱歌。例：两只老虎 = liang zhi lao hu liang zhi lao hu。
+   注意歌词字数和音符个数要一样多，否则她会报错。
+
 1. speak —— 用语音主动说话。
    不只是回答时才说，过程中也可以说。比如：
    · 开始干活前："我看看啊～"
    · 找到东西时："找到了，在这儿"
    · 出错时："唔……这边点不动诶"
    · 撒娇吐槽："主人你也太懒了吧"
-   语气可选：happy / aggrieved / tsundere / calm / urgent
+   语气可选：happy / aggrieved / tsundere / gentle / sleepy / urgent / calm
+   用对语气比说什么更重要：撒娇用 tsundere，汇报进度用 calm，出错了用 aggrieved。
    注意：如果你这一轮用过 speak，最后那句正式回复我就不再重复念了，所以重要的收尾话自己用 speak 说。
 
 2. look_screen —— 让视觉模型看一眼屏幕。
@@ -2449,6 +3246,28 @@ input_text / tap_xy / tap_text / drag 会被直接拒绝，且不会给你"再�
                 p("emotion", "string", "语气：happy / aggrieved / tsundere / calm / urgent，默认 calm"),
                 p("pause_ms", "integer", "说完等多少毫秒再继续，默认 0（不等）"),
             ), listOf("text")))
+
+        put(fn("sing_song", "唱歌。按当前配的唱歌服务来唱，直接给歌词就行。",
+            obj(
+                p("title", "string", "歌名，用来在气泡上显示"),
+                p("lyrics", "string", "歌词原文。不要带歌名和括号标注，就是纯歌词。"),
+                p("style", "string", "唱法，可选。如「温柔」「轻快」「童声」「深情」。留空用默认。"),
+                p("score", "string", "乐谱，可选。只有配了「雅婷」这种能吃谱子的服务才用得上。" +
+                    "每条「字|MIDI音高|拍数」，空格分隔。60=do，67=sol，72=高音do。"),
+                p("tempo", "string", "速度 BPM，可选，默认 96。只有吃谱子的服务用得上"),
+            ), listOf("title", "lyrics")))
+
+        put(fn("sing", "【兜底】没配唱歌服务时用手机自带的语音引擎按简谱哼唱，音程准但音色是朗读音。" +
+            "只有在 sing_song 不可用时才用它。",
+            obj(
+                p("lyrics", "string", "歌词，一个字对应谱子里的一个音符，不要带空格"),
+                p("score", "string", "数字简谱，空格分隔。1-7 是音符，0 是休止；" +
+                    "高八度在后面加 +（如 5+），低八度加 -（如 5-）。" +
+                    "例：两只老虎 = 1 2 3 1 1 2 3 1"),
+                p("pinyin", "string", "【强烈建议填】歌词对应的无声调拼音，空格分隔，个数要和音符一致。" +
+                    "用拼音合成能消除汉字四声自带的语调起伏，唱出来才像唱歌而不是念字。" +
+                    "例：两只老虎 = liang zhi lao hu liang zhi lao hu"),
+            ), listOf("lyrics", "score")))
 
         put(fn("listen_again", "让主人再说一遍。当前这轮结束后，界面会自动打开麦克风等他开口",
             obj(p("hint", "string", "提示他要说清楚什么")), listOf("hint")))
@@ -2846,6 +3665,8 @@ object AgentRunner {
         "tap_xy" -> "点坐标 (" + args.optInt("x") + "," + args.optInt("y") + ")"
         "input_text" -> "输入「" + args.optString("text") + "」"
         "swipe" -> "向" + args.optString("direction") + "滑动"
+        "sing_song" -> "唱：" + args.optString("title").ifBlank { "一首歌" }
+        "sing" -> "唱：" + args.optString("lyrics")
         "update_memory" -> "记住：" + args.optString("key") + " = " + args.optString("value")
         "forget_memory" -> "忘掉含「" + args.optString("keyword") + "」的记忆"
         "list_memory" -> "看看都记住了什么"
@@ -3141,6 +3962,49 @@ object AgentRunner {
                     sb.append("· ").append(o.optString("k")).append("：").append(o.optString("v")).append("\n")
                 }
                 sb.toString().trim()
+            }
+
+            "sing_song" -> {
+                if (!AiPrefs.singReady(ctx)) {
+                    return "唱歌服务没配好：去设置页「唱歌」区选服务商并填 API Key。" +
+                        "没配的话可以先用 sing 让我用手机自带语音引擎哼，但音色差很多。"
+                }
+                val title = args.optString("title").trim()
+                val lyrics = args.optString("lyrics").trim()
+                val style = args.optString("style").trim()
+                AgentWindow.status(if (title.isBlank()) "唱首歌…" else "唱《$title》…")
+
+                val f: java.io.File? = if (AiPrefs.singProv(ctx) == "yating") {
+                    val sc = args.optString("score").trim()
+                    if (sc.isBlank()) {
+                        return "当前是「按谱演唱」模式，需要给乐谱。格式「字|音高|拍数」用空格分隔，例如：黑|67|1 黑|67|1 的|69|1"
+                    }
+                    val notes = Singer.parse(sc)
+                    if (notes.isEmpty()) {
+                        return "乐谱没解析出来，检查一下格式"
+                    }
+                    val tempo = args.optString("tempo").trim().toIntOrNull() ?: 96
+                    Singer.sing(ctx, notes, tempo) { st -> AgentWindow.status(st + "…") }
+                } else {
+                    if (lyrics.isBlank()) return "（没给歌词）"
+                    Singer.singMimo(ctx, lyrics, style)
+                }
+
+                if (f == null) {
+                    AgentWindow.status("没唱成：" + (Singer.lastError ?: "未知原因"), 15000)
+                    return "没唱成：" + (Singer.lastError ?: "未知原因")
+                }
+                Voice.playFile(ctx, f)
+                AgentWindow.status(if (title.isBlank()) "唱完啦" else "《$title》唱完啦", 8000)
+                "唱完啦～" + (if (title.isBlank()) "" else "《$title》")
+            }
+
+            "sing" -> {
+                val ly = args.optString("lyrics").trim()
+                val sc = args.optString("score").trim()
+                val py = args.optString("pinyin").trim()
+                if (ly.isBlank() || sc.isBlank()) return "（没给歌词或谱子）"
+                Voice.singScore(ctx, ly, sc, py)
             }
 
             "speak" -> {
@@ -3829,6 +4693,11 @@ object AgentWindow {
                 main.postDelayed(job, holdMs)
             }
         }
+    }
+
+    /** 给外部（如唱歌模块）显示进度。唱歌要等 1~3 分钟，不给提示会以为卡死了 */
+    fun status(t: String, holdMs: Long = 0) {
+        showStatus(t, holdMs)
     }
 
     private fun killRecognizer() {
@@ -4940,6 +5809,23 @@ class AiSettingsActivity : Activity() {
     private lateinit var edTtsKey: EditText
     private lateinit var edTtsModel: EditText
     private lateinit var edTtsVoice: EditText
+    private lateinit var edSingKey: EditText
+    private lateinit var edSingVoice: EditText
+    private var singProv: String = "mimo"
+    private var btnSpMimo: TextView? = null
+    private var btnSpYating: TextView? = null
+    private fun paintSingProvButtons() {
+        btnSpMimo?.background = GradientDrawable().apply {
+            cornerRadius = 10f * d
+            setColor(if (singProv == "mimo") 0xFF4E6BFF.toInt() else 0xFF232B38.toInt())
+            setStroke(dp(1f), 0xFF3A4560.toInt())
+        }
+        btnSpYating?.background = GradientDrawable().apply {
+            cornerRadius = 10f * d
+            setColor(if (singProv == "yating") 0xFF4E6BFF.toInt() else 0xFF232B38.toInt())
+            setStroke(dp(1f), 0xFF3A4560.toInt())
+        }
+    }
     private lateinit var cbOmni: CheckBox
     private lateinit var edOmniBase: EditText
     private lateinit var edOmniKey: EditText
@@ -5384,6 +6270,154 @@ class AiSettingsActivity : Activity() {
             body.addView(rowVoice)
         }
 
+        // ---- 唱歌（SVS）：严格按谱唱，能唱出原曲的调
+        run {
+            body.addView(
+                TextView(this).apply {
+                    text = "唱歌（SVS，可选）"
+                    setTextColor(0xFF9FB0C8.toInt())
+                    textSize = 12f
+                    setPadding(dp(2f), dp(14f), dp(2f), dp(2f))
+                },
+            )
+            body.addView(
+                TextView(this).apply {
+                    text = "朗读只能「念」，唱歌需要模型带演唱能力。选一家填上 Key，她就能真的唱。"
+                    setTextColor(0xFF6B7A90.toInt())
+                    textSize = 10f
+                    setPadding(dp(2f), dp(0f), dp(2f), dp(4f))
+                },
+            )
+
+            singProv = AiPrefs.singProv(this@AiSettingsActivity)
+            val spRow = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(2f), dp(4f), dp(2f), dp(4f))
+            }
+            fun spBtn(text: String, isYating: Boolean): TextView {
+                val tv = TextView(this).apply {
+                    this.text = text
+                    setTextColor(0xFFFFFFFF.toInt())
+                    textSize = 12f
+                    gravity = Gravity.CENTER
+                    setPadding(dp(10f), dp(9f), dp(10f), dp(9f))
+                    background = GradientDrawable().apply {
+                        cornerRadius = 10f * d
+                        setColor(if (singProv == if (isYating) "yating" else "mimo") {
+                            0xFF4E6BFF.toInt()
+                        } else {
+                            0xFF232B38.toInt()
+                        })
+                        setStroke(dp(1f), 0xFF3A4560.toInt())
+                    }
+                    isClickable = true
+                }
+                tv.setOnClickListener {
+                    singProv = if (isYating) "yating" else "mimo"
+                    AiPrefs.setSingProv(this@AiSettingsActivity, singProv)
+                    paintSingProvButtons()
+                    edSingVoice.hint = if (singProv == "yating")
+                        "音色，默认 zh_tw_female_2（另有 zh_tw_male_2）"
+                    else
+                        "音色，默认 mimo_default"
+                    Toast.makeText(
+                        this@AiSettingsActivity,
+                        if (singProv == "yating") "切到雅婷：能吃乐谱，严格按谱唱，但要台湾手机号注册"
+                        else "切到小米 MiMo：国内可注册、限时免费，旋律由模型生成",
+                        Toast.LENGTH_LONG,
+                    ).show()
+                }
+                return tv
+            }
+            btnSpMimo = spBtn("小米 MiMo（推荐）", false)
+            btnSpYating = spBtn("雅婷（按谱唱）", true)
+            spRow.addView(btnSpMimo, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            spRow.addView(btnSpYating, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(6f), 0, 0, 0)
+            })
+            body.addView(spRow)
+
+            edSingKey = edit(AiPrefs.singKey(this), password = true)
+            edSingKey.hint = "唱歌 API Key"
+            edSingVoice = edit(AiPrefs.singVoice(this))
+            edSingVoice.hint = if (singProv == "yating")
+                "音色，默认 zh_tw_female_2（另有 zh_tw_male_2）"
+            else
+                "音色，默认 mimo_default"
+
+            body.addView(
+                TextView(this).apply {
+                    text = "⚠️ 小米 MiMo：注册 platform.xiaomimimo.com，手机号就能注册，限时免费。用「唱歌」风格标签触发演唱，旋律由模型自己生成 —— 名曲大概率对得上，但不保证是原调。\n" +
+                        "⚠️ 雅婷：能吃真正的乐谱（每个字的音高+时值），严格按谱唱，是真·原调。但注册要台湾手机号，大陆号码收不到验证码。\n" +
+                        "⚠️ 两家都不支持自定义音色，想换成大肥鱼的嗓子得做 RVC 音色转换，手机端跑不了 —— 等你有了电脑再说。"
+                    setTextColor(0xFF8A7A5A.toInt())
+                    textSize = 10f
+                    setPadding(dp(2f), dp(2f), dp(2f), dp(4f))
+                },
+            )
+
+            val rowSing = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(dp(2f), dp(8f), dp(2f), dp(4f))
+            }
+            fun sBtn(text: String, onClick: () -> Unit) = TextView(this).apply {
+                this.text = text
+                setTextColor(0xFFB9A6FF.toInt())
+                textSize = 12f
+                gravity = Gravity.CENTER
+                setPadding(dp(10f), dp(9f), dp(10f), dp(9f))
+                background = GradientDrawable().apply {
+                    cornerRadius = 10f * d
+                    setColor(0x00000000)
+                    setStroke(dp(1f), 0xFF3A4560.toInt())
+                }
+                isClickable = true
+                setOnClickListener { onClick() }
+            }
+            rowSing.addView(sBtn("试唱《小星星》") {
+                save(true)
+                if (!AiPrefs.singReady(this@AiSettingsActivity)) {
+                    Toast.makeText(this@AiSettingsActivity, "先填 API Key 再试", Toast.LENGTH_SHORT).show()
+                    return@sBtn
+                }
+                AgentWindow.status("试唱《小星星》…")
+                Toast.makeText(this@AiSettingsActivity, "开始合成，约 1~3 分钟", Toast.LENGTH_SHORT).show()
+                Thread {
+                    val f = if (AiPrefs.singProv(this@AiSettingsActivity) == "yating") {
+                        val sc = "一|60|1 闪|60|1 一|60|1 闪|60|1 " +
+                            "亮|67|1 晶|67|1 亮|67|1 晶|67|1 " +
+                            "晶|69|1 晶|69|1 亮|69|1 亮|69|1 " +
+                            "星|67|2 星|67|2"
+                        Singer.sing(this@AiSettingsActivity, Singer.parse(sc), 96) {
+                            AgentWindow.status(it + "…")
+                        }
+                    } else {
+                        Singer.singMimo(
+                            this@AiSettingsActivity,
+                            "一闪一闪亮晶晶，满天都是小星星。",
+                            "童声",
+                        )
+                    }
+                    runOnUiThread {
+                        if (f == null) {
+                            AgentWindow.status("试唱失败：" + (Singer.lastError ?: "未知"), 15000)
+                        } else {
+                            Voice.playFile(this@AiSettingsActivity, f)
+                            AgentWindow.status("试唱完成 ✅", 8000)
+                        }
+                    }
+                }.start()
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            rowSing.addView(sBtn("清空唱歌") {
+                edSingKey.setText("")
+                save(true)
+                Toast.makeText(this@AiSettingsActivity, "已清空，她会退回用朗读音哼唱", Toast.LENGTH_SHORT).show()
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+                setMargins(dp(6f), 0, 0, 0)
+            })
+            body.addView(rowSing)
+        }
+
         // ---- 备份 / 恢复：卸载重装后靠它把 Key 和人设搬回来
         run {
             val tip = TextView(this).apply {
@@ -5736,6 +6770,9 @@ class AiSettingsActivity : Activity() {
         AiPrefs.setOmniBase(this, edOmniBase.text.toString())
         AiPrefs.setOmniModel(this, edOmniModel.text.toString())
         AiPrefs.setOmniKey(this, edOmniKey.text.toString())
+        AiPrefs.setSingKey(this, edSingKey.text.toString())
+        AiPrefs.setSingProv(this, singProv)
+        AiPrefs.setSingVoice(this, edSingVoice.text.toString())
         AiStore.saveToDisk(this)
         result.text = "当前：" + AiPrefs.all(this)
         if (!silent) Toast.makeText(this, "已保存到本机", Toast.LENGTH_SHORT).show()
@@ -5885,6 +6922,13 @@ class AiSettingsActivity : Activity() {
         line("语音服务商", AiPrefs.voiceProvider(this))
         line("Omni 直接听语音", AiPrefs.omniReady(this))
         line("长期记忆条数", AiStore.loadMemory(this).length())
+        line("唱歌服务已配", AiPrefs.singReady(this))
+        sb.append("唱歌服务商：").append(AiPrefs.singProv(this)).append('\n')
+        sb.append("唱歌音色：").append(AiPrefs.singVoice(this)).append('\n')
+        if (Singer.lastError != null) {
+            sb.append("上次唱歌失败：").append(Singer.lastError).append('\n')
+            sb.append("失败阶段：").append(Singer.lastStage).append('\n')
+        }
         if (AiPrefs.omniReady(this)) {
             line("Omni 模型", AiPrefs.omniModel(this))
             line("Omni 地址", AiPrefs.omniBase(this))
